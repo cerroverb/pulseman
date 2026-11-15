@@ -261,9 +261,18 @@ static int make_sound(mdrt *m)
     int made = 0;
     uint32_t t = 0;
     m->next = 0;
+    /* a frame run ahead whose chips the game never reads (their sections presentation): the
+     * client's processor ticks as ever, the chips are not run (their sound would be dropped, and
+     * the state put back after puts them back) */
+    int still = m->ahead_on && m->fixed_kind[2] == MDRT_PART_PRESENTATION && m->fixed_kind[3] == MDRT_PART_PRESENTATION;
     while (t < m->frame) {
         uint32_t until = t + CHUNK < m->frame ? t + CHUNK : m->frame;
         if (m->tick) m->tick(m->tick_user, until);
+        if (still) {
+            while (m->next < m->nev && m->ev[m->next].at < until) m->next++;
+            t = until;
+            continue;
+        }
         while (m->next < m->nev && m->ev[m->next].at < until) {
             event *e = &m->ev[m->next++];
             if (e->at > t) { made = run_chips(m, (uint32_t)e->at - t, made); t = (uint32_t)e->at; }
