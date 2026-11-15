@@ -95,6 +95,8 @@ static const char *const replay_label[5] = { "off", "10 s", "20 s", "30 s", "60 
 static const char *const gif_scale_label[3] = { "1x", "2x", "3x" };
 static const int fast_speeds[6] = { 2, 3, 4, 6, 8, 0 };
 static const char *const fast_label[6] = { "2x", "3x", "4x", "6x", "8x", "max" };
+#define AHEAD_MAX 8
+static const char *const ahead_label[AHEAD_MAX + 1] = { "off", "1 frame", "2 frames", "3 frames", "4 frames", "5 frames", "6 frames", "7 frames", "8 frames" };
 enum { NET_HOST, NET_JOIN, NET_BOTH };
 static const char *const net_role_name[3] = { "host", "join", "both" };
 static const char *const net_role_label[3] = { "host", "join", "both connect" };
@@ -111,7 +113,7 @@ enum { PAGE_MAIN, PAGE_VIDEO, PAGE_SOUND, PAGE_OPTIONS, PAGE_KEYS, PAGE_ROM, PAG
        PAGE_CLIENT, PAGE_PICK, PAGE_NET };
 enum { SLOT_COUNT = 8 };                                  /* save slots; 0 is the Autosave (where the last run was, kept on quitting) */
 enum { I_RESUME = 1, I_ROM, I_RESET, I_SAVE, I_LOAD, I_VIDEO, I_SOUND, I_OPTIONS, I_KEYS, I_QUIT, I_BACK,
-       I_UPSCALE, I_SCALE, I_ASPECT, I_FULL, I_VSYNC, I_COLOURS, I_BLEND, I_SCANLINES, I_MASK, I_VOLUME, I_MUTE, I_FM_CORE, I_FM_CHIP, I_LOWPASS, I_FAST, I_UP,
+       I_UPSCALE, I_SCALE, I_ASPECT, I_FULL, I_VSYNC, I_COLOURS, I_BLEND, I_SCANLINES, I_MASK, I_VOLUME, I_MUTE, I_FM_CORE, I_FM_CHIP, I_LOWPASS, I_RUN_AHEAD, I_FAST, I_UP,
        I_PLAYERS, I_ADAPTOR, I_TURBO, I_DEADZONE, I_CBUTTONS,
        I_CAPTURE, I_CAP_REPLAY, I_CAP_RECORD, I_CAP_SECONDS, I_CAP_GIFSCALE, I_USE, I_FPS, I_CSECTION,
        I_NET, I_NET_ROLE, I_NET_ADDR, I_NET_PORT, I_NET_DELAY, I_NET_START, I_NET_LEAVE, I_NET_NAME, I_NET_HERE, I_NET_ALL,
@@ -152,6 +154,7 @@ typedef struct sdl {
     SDL_atomic_t saves, loads, rewind;      /* presses of the state keys since the game last asked; held */
     SDL_atomic_t fast, slow, step, volume, mute;
     SDL_atomic_t fm_want;       /* 1 + the FM core's index x 2 + the model: for the game thread to make */
+    SDL_atomic_t run_ahead;     /* run-ahead's frames (the Options page) */
     SDL_atomic_t lowpass_want;  /* 1 + the low-pass (0 off, 1 on): for the game thread to set */
     SDL_GameController *ctrl[SLOTS];   /* the controllers, each in the slot it was given when plugged in */
     const mdrt_sdl_options *o;
@@ -369,6 +372,15 @@ static void audio(void *user, const int16_t *samples, int frames)
     if (k) { samples = s->stretched; frames = k; }
     SDL_QueueAudio(s->dev, samples, (Uint32)frames * 4);
     if (++s->queued == (unsigned)s->queue_frames) SDL_PauseAudioDevice(s->dev, 0);   /* start once there is some */
+}
+
+/* run-ahead's frames now: none online (rollback has its own), paused, in the menu, slowed or fast
+ * (there the frame shown is the frame) */
+static int ahead_frames(void *user)
+{
+    sdl *s = user;
+    if (!s->o->can_run_ahead || SDL_AtomicGet(&s->session) || held(s) || SDL_AtomicGet(&s->fast) || SDL_AtomicGet(&s->slow)) return 0;
+    return SDL_AtomicGet(&s->run_ahead);
 }
 
 static int ending(sdl *s) { return SDL_AtomicGet(&s->quit) || SDL_AtomicGet(&s->stop); }
@@ -954,6 +966,8 @@ static void settings_load(sdl *s)
             "# audio.fm_core: nuked or ymfm. audio.fm_chip: YM2612 or YM3438.\n"
             "# audio.lowpass: off or on (a Model 1 console's low-pass on the sound: 3390 Hz, as BlastEm has it).\n"
             "# general.fast_forward: times the speed while it is held (0: as fast as it goes).\n"
+            "# general.run_ahead: frames shown ahead of the game, 0 (off) to 8 (input lag taken away; past the\n"
+            "# game's own delay, frames of its pictures are skipped).\n"
             "# capture.replay: the seconds kept for the replay (0: off). capture.gif_scale: 1-3. A\n"
             "# control's key may have Shift+, Ctrl+ or Alt+ before it.\n"
             "# netplay (the Online page): role host, join or both (each connecting to the other at once);\n"
@@ -1039,6 +1053,7 @@ static void settings_load(sdl *s)
     SDL_AtomicSet(&s->mute, mdrt_settings_get_int(s->set, "audio.mute", 0) != 0);
     s->queue_frames = clamp(mdrt_settings_get_int(s->set, "audio.latency", 3), 1, 10);
     SDL_AtomicSet(&s->fast_speed, clamp(mdrt_settings_get_int(s->set, "general.fast_forward", 4), 0, 100));
+    SDL_AtomicSet(&s->run_ahead, clamp(mdrt_settings_get_int(s->set, "general.run_ahead", clamp(o->run_ahead, 0, AHEAD_MAX)), 0, AHEAD_MAX));
     mdrt_settings_default(s->set, "general.states", "states");
     mdrt_settings_default(s->set, "general.slot", "1");
     mdrt_settings_default(s->set, "general.show_fps", "0");
@@ -1673,6 +1688,10 @@ static void build_page(sdl *s, int page, int select)
         int speed = 2, want = SDL_AtomicGet(&s->fast_speed);
         for (int i = 0; i < 6; i++) if (fast_speeds[i] == want) speed = i;
         mdrt_menu_add_choice(m, I_FAST, "Fast-forward speed", fast_label, 6, speed);
+        if (s->o->can_run_ahead) {
+            mdrt_menu_add_choice(m, I_RUN_AHEAD, "Run-ahead", ahead_label, AHEAD_MAX + 1, SDL_AtomicGet(&s->run_ahead));
+            snprintf(m->subtitle, sizeof m->subtitle, "Run-ahead: input lag taken away. Past the game's own delay it skips frames.");
+        }
         mdrt_menu_add_choice(m, I_FPS, "FPS counter", off_on, 2, s->show_fps);
         mdrt_menu_add(m, I_BACK, MDRT_ITEM_ACTION, "Back");
         break;
@@ -2266,6 +2285,10 @@ static void act(sdl *s, int id)
         mdrt_settings_set(s->set, "audio.lowpass", off_on[it->value]);
         if (running) SDL_AtomicSet(&s->lowpass_want, 1 + it->value);   /* (set between frames) */
         return;
+        return;
+    case I_RUN_AHEAD:
+        SDL_AtomicSet(&s->run_ahead, it->value);
+        mdrt_settings_set_int(s->set, "general.run_ahead", it->value);
         return;
     case I_FAST:
         SDL_AtomicSet(&s->fast_speed, fast_speeds[it->value]);
@@ -2976,7 +2999,7 @@ int mdrt_sdl_run(mdrt_config *cfg, const mdrt_sdl_options *o, mdrt_game_fn game,
     if (!s->cap) s->replay = 0;
     else capture_set(s);
     cfg->platform = (mdrt_platform){ .user = s, .present = present, .audio = audio, .wait = frame_wait, .input = input, .requests = requests,
-                                     .request_path = request_path, .idle = idle };
+                                     .request_path = request_path, .idle = idle, .ahead = ahead_frames };
     mdrt_menu_init(&s->menu);
     char why[1200] = "";
     if (o->rom_check && !first_rom(s, why, sizeof why)) {   /* no ROM yet: the menu's ROM page */

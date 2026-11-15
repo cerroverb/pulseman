@@ -55,6 +55,11 @@ typedef struct mdrt_platform {
      * called every millisecond or so while it does; nonzero: the platform is closing, and the game
      * should stop (NULL: never) */
     int (*idle)(void *user);
+    /* run-ahead: the frames the player wants shown ahead of the game now (0 or NULL: none; the
+     * SDL2 platform's setting, 0 while paused, slowed, fast or online). When nonzero at a handshake
+     * the frame's picture is held, not presented, for the client to run ahead (mdrt_ahead) or to
+     * show it as it is (mdrt_present_held) */
+    int (*ahead)(void *user);
 } mdrt_platform;
 
 /* requests from the person playing, which the client carries out where it can (a state saved at
@@ -242,6 +247,20 @@ int mdrt_add_state_memory(mdrt *m, const char *tag, void *data, size_t size);
  * handshakes still to come. Quiet is not part of a state. */
 void mdrt_set_quiet(mdrt *m, int n);
 int mdrt_quiet(const mdrt *m);
+/* Run-ahead (input lag taken away, as a frame or more of the game's own delay): at a handshake
+ * where the platform wants frames ahead (mdrt_platform.ahead) the picture is held and
+ * mdrt_ahead_wanted says how many. The client then either keeps a state where it can go on from,
+ * calls mdrt_ahead(m, n) and plays on: the next n handshakes are the frames run ahead, with the
+ * pads as the last handshake read them, no sound, no wait and no requests, none drawn but the
+ * n-th's frame, which the n-th handshake presents; handshakes after it stay silent until the client
+ * loads its state back and calls mdrt_ahead(m, 0), the game going on as if nothing had been run.
+ * Or it calls mdrt_present_held to show the frame as it is (where it cannot keep a state). The
+ * chips are clocked through the frames run ahead (their sound made and dropped) and a state put
+ * back puts them back. mdrt_ahead_running: inside such frames (a handshake counted among them). */
+int mdrt_ahead_wanted(const mdrt *m);
+void mdrt_ahead(mdrt *m, int n);
+int mdrt_ahead_running(const mdrt *m);
+void mdrt_present_held(mdrt *m);
 /* the platform's input now (the buttons its players hold), whether or not a pad source is set;
  * zeros when the platform has no input */
 void mdrt_platform_input(mdrt *m, uint16_t buttons[MDRT_PADS]);

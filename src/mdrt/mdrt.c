@@ -51,6 +51,11 @@ struct mdrt {
     mdrt_hint_fn hint;
     void *hint_user;
     int quiet;                  /* quiet handshakes to come (frames played again: mdrt_set_quiet) */
+    int ahead;                  /* run-ahead: handshakes still to come before the one presented */
+    int ahead_on;               /* run-ahead: in frames run ahead (mdrt_ahead) */
+    int ahead_want;             /* frames ahead the platform wanted at the last handshake (its picture held) */
+    uint16_t *held;             /* that picture, 320 x 240 */
+    int held_w, held_h;
     struct mdrt_net *net;       /* the netplay session it plays in (mdrt_set_net) */
     uint8_t fixed_kind[8];      /* the console's sections' kinds (CONS's own: mdrt_sim_hash) */
     uint8_t *scratch;           /* a section's bytes, for the simulation hash */
@@ -131,6 +136,7 @@ void mdrt_free(mdrt *m)
 {
     if (!m) return;
     mdrt_fm_free(m->fm);
+    free(m->held);
     free(m->picture); free(m->fm_buf); free(m->psg_buf); free(m->audio); free(m->ev); free(m->dma); free(m->scratch);
     free(m);
 }
@@ -449,29 +455,43 @@ int mdrt_wait_vblank(mdrt *m)
 {
     advance(m, m->frame);                                 /* the rest of the picture */
     int made = make_sound(m);
-    rec_frame(m, made);
     const mdrt_platform *p = &m->cfg.platform;
-    int quiet = m->quiet > 0, stop = 0;                   /* (a frame played again: the platform never sees it) */
-    if (quiet) m->quiet--;
+    int ahead = m->ahead_on, quiet = ahead || m->quiet > 0, stop = 0;   /* (a frame played again or run ahead: the platform never sees it) */
+    if (!ahead) rec_frame(m, made);
+    if (ahead) {                                          /* (a frame run ahead: only the last is shown) */
+        if (m->ahead > 0 && --m->ahead == 0 && p->present)
+            p->present(p->user, m->picture, mdrt_vdp_width(&m->vdp), mdrt_vdp_height(&m->vdp), 320);
+    } else if (quiet) m->quiet--;
     else {
-        if (p->present) p->present(p->user, m->picture, mdrt_vdp_width(&m->vdp), mdrt_vdp_height(&m->vdp), 320);
+        if (m->ahead_want > 0) mdrt_present_held(m);      /* (one held and neither run ahead nor shown: shown now) */
+        m->ahead_want = p->ahead ? p->ahead(p->user) : 0;
+        if (m->ahead_want > 0 && (m->held || (m->held = malloc(320 * 240 * sizeof *m->held)))) {   /* (held for run-ahead) */
+            m->held_w = mdrt_vdp_width(&m->vdp);
+            m->held_h = mdrt_vdp_height(&m->vdp);
+            memcpy(m->held, m->picture, 320 * 240 * sizeof *m->held);
+        } else {
+            m->ahead_want = 0;
+            if (p->present) p->present(p->user, m->picture, mdrt_vdp_width(&m->vdp), mdrt_vdp_height(&m->vdp), 320);
+        }
         if (p->audio) p->audio(p->user, m->audio, made);
         stop = p->wait ? p->wait(p->user) : 0;
     }
     uint16_t buttons[MDRT_PADS];
     memcpy(buttons, m->pads.buttons, sizeof buttons);
-    if (m->pad_src) m->pad_src(m->pad_user, buttons);
-    else if (p->input) p->input(p->user, buttons);
+    if (!ahead) {                                         /* (frames run ahead: the pads as the last handshake read them) */
+        if (m->pad_src) m->pad_src(m->pad_user, buttons);
+        else if (p->input) p->input(p->user, buttons);
+    }
     for (int i = 0; i < MDRT_PADS; i++) mdrt_pad_set(&m->pads, i, buttons[i]);
     mdrt_pads_frame(&m->pads);
-    rec_buttons(m);
+    if (!ahead) rec_buttons(m);
     m->requests = !quiet && p->requests ? p->requests(p->user) : 0;
     m->request_path = m->requests && p->request_path ? p->request_path(p->user) : NULL;
     m->frames++;
     m->nudge = 0;
     m->now = 0;
     mdrt_vdp_beam_start(&m->lines, &m->vdp, m->picture, 320);
-    m->lines.quiet = m->quiet > 0;                        /* (drawn again from the frame the last quiet handshake begins) */
+    m->lines.quiet = ahead ? m->ahead != 1 : m->quiet > 0;   /* (drawn again from the frame the last quiet handshake begins; ahead, the last one's) */
     m->reloaded = 0;
     mdrt_vdp_set_position(&m->vdp, 224, 0);
     mdrt_vdp_set_vblank(&m->vdp, 1);
@@ -488,6 +508,24 @@ void mdrt_set_quiet(mdrt *m, int n)
     m->lines.quiet = m->quiet > 0;
 }
 int mdrt_quiet(const mdrt *m) { return m->quiet; }
+
+int mdrt_ahead_wanted(const mdrt *m) { return m->ahead_want; }
+int mdrt_ahead_running(const mdrt *m) { return m->ahead_on; }
+
+void mdrt_ahead(mdrt *m, int n)
+{
+    m->ahead_on = n > 0;
+    m->ahead = n > 0 ? n : 0;
+    m->ahead_want = 0;                                    /* (the held picture is not needed) */
+    m->lines.quiet = n > 1 || (n <= 0 && m->quiet > 0);
+}
+
+void mdrt_present_held(mdrt *m)
+{
+    const mdrt_platform *p = &m->cfg.platform;
+    if (m->ahead_want > 0 && p->present) p->present(p->user, m->held, m->held_w, m->held_h, 320);
+    m->ahead_want = 0;
+}
 
 void mdrt_platform_input(mdrt *m, uint16_t buttons[MDRT_PADS])
 {

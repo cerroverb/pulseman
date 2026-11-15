@@ -7,7 +7,11 @@
  * three ways; the platform sees no quiet handshake (no present, audio, wait or requests) and every
  * other frame's picture and sound are the same as the first run's. Then: the hash leaves out the
  * FM chip (two FM cores, the same hashes) and the picture, takes in a client's part unless it is
- * marked presentation, and mdrt_platform_input reads the platform's buttons under a pad source. */
+ * marked presentation, and mdrt_platform_input reads the platform's buttons under a pad source.
+ * And run-ahead (mdrt_ahead): three frames run ahead after every handshake and the state put back,
+ * the simulation, the sound and the platform's waits the same as the first run's, and the picture
+ * shown the first run's three handshakes on wherever the pads held; the frames shown as they are
+ * (mdrt_present_held) the first run's own. */
 #include <stdlib.h>
 #include <string.h>
 #include "check.h"
@@ -25,8 +29,10 @@ static uint64_t fnv(uint64_t h, const void *p, size_t n)
 
 /* what the platform saw, by handshake (1 to FRAMES); 0: nothing */
 typedef struct seen {
-    uint64_t pic[FRAMES + 2], snd[FRAMES + 2], sim[FRAMES + 2];
+    uint64_t pic[FRAMES + 8], snd[FRAMES + 8], sim[FRAMES + 8];   /* (frames run ahead go past the last) */
     int presents, audios, waits, requests;
+    int want;                   /* run-ahead's frames, the platform's */
+    uint64_t last;              /* the last picture presented */
     mdrt *m;
 } seen;
 
@@ -35,7 +41,8 @@ static void present(void *user, const uint16_t *px, int w, int h, int pitch)
     seen *s = user;
     uint64_t f = FNV0;
     for (int y = 0; y < h; y++) f = fnv(f, px + y * pitch, (size_t)w * 2);
-    s->pic[mdrt_frame_count(s->m) + 1] = f;               /* (the handshake ending frame n is the n + 1th) */
+    s->last = f;
+    if (!mdrt_ahead_running(s->m)) s->pic[mdrt_frame_count(s->m) + 1] = f;   /* (the handshake ending frame n is the n + 1th) */
     s->presents++;
 }
 static void audio(void *user, const int16_t *x, int n)
@@ -46,15 +53,23 @@ static void audio(void *user, const int16_t *x, int n)
 }
 static int wait(void *user) { ((seen *)user)->waits++; return 0; }
 static unsigned requests(void *user) { ((seen *)user)->requests++; return 0; }
+static int ahead_frames(void *user) { return ((seen *)user)->want; }
 static void platform_input(void *user, uint16_t b[MDRT_PADS]) { (void)user; b[0] = MDRT_PAD_A; b[1] = MDRT_PAD_START; }
 
 /* the pads by frame: a pattern that changes now and then */
-static void pad_source(void *user, uint16_t b[MDRT_PADS])
+static void pads_at(uint64_t f, uint16_t b[MDRT_PADS])
 {
-    uint64_t f = mdrt_frame_count(user) + 1;
     b[0] = (uint16_t)((f / 7) % 3 == 0 ? MDRT_PAD_RIGHT | MDRT_PAD_B : (f / 5) % 2 ? MDRT_PAD_LEFT : 0);
     b[1] = (uint16_t)(f % 11 < 4 ? MDRT_PAD_C : 0);
     b[2] = b[3] = 0;
+}
+static void pad_source(void *user, uint16_t b[MDRT_PADS]) { pads_at(mdrt_frame_count(user) + 1, b); }
+static int pads_held(uint64_t f, uint64_t to)
+{
+    uint16_t a[MDRT_PADS], b[MDRT_PADS];
+    pads_at(f, a);
+    for (uint64_t k = f + 1; k <= to; k++) { pads_at(k, b); if (memcmp(a, b, sizeof a)) return 0; }
+    return 1;
 }
 
 /* the client: everything it keeps from one frame to the next (a part of every state) */
@@ -112,7 +127,7 @@ static mdrt *console(seen *s, const char *core)
     c.fm_core = core;
     c.sram_size = 0x100;
     c.platform = (mdrt_platform){ .user = s, .present = present, .audio = audio, .wait = wait, .requests = requests,
-                                  .input = platform_input };
+                                  .input = platform_input, .ahead = ahead_frames };
     mdrt *m = mdrt_new(&c);
     s->m = m;
     gm = m;
@@ -264,6 +279,53 @@ static void run(void)
     uint16_t pb[MDRT_PADS];
     mdrt_platform_input(gm, pb);
     CHECK_EQ(pb[0], MDRT_PAD_A); CHECK_EQ(pb[1], MDRT_PAD_START); CHECK_EQ(pb[2], 0);
+    mdrt_free(gm);
+
+    /* run-ahead: three frames ahead after every handshake, the state put back; every tenth frame
+     * (at 5) shown as it is */
+    static seen e;
+    static uint64_t ahead_shown[FRAMES + 2];
+    memset(&e, 0, sizeof e);
+    console(&e, NULL);
+    e.want = 3;
+    uint8_t *ahead = NULL;
+    int wanted = 0, asis = 0, onward = 0, moved = 0, back = 0;
+    while (mdrt_frame_count(gm) < FRAMES) {
+        step(&e);
+        uint64_t k = mdrt_frame_count(gm);
+        wanted += mdrt_ahead_wanted(gm) == 3;
+        if (k % 10 == 5) { mdrt_present_held(gm); ahead_shown[k] = e.last; continue; }
+        size_t len = mdrt_get_state(gm, NULL, 0);
+        ahead = realloc(ahead, len);
+        mdrt_get_state(gm, ahead, len);
+        game kept = g;
+        mdrt_ahead(gm, 3);
+        int presented = e.presents;
+        for (int i = 0; i < 3; i++) step(&e);
+        moved += e.presents == presented + 1;
+        ahead_shown[k] = e.last;
+        mdrt_ahead(gm, 0);
+        back += mdrt_set_state(gm, ahead, len) == 0 && mdrt_frame_count(gm) == k && !memcmp(&g, &kept, sizeof g);
+    }
+    free(ahead);
+    for (uint64_t k = 1; k <= FRAMES; k++) {
+        if (k % 10 == 5) asis += ahead_shown[k] == a.pic[k];
+        else if (k + 3 <= FRAMES && pads_held(k, k + 2)) onward += ahead_shown[k] == a.pic[k + 3];
+    }
+    int held = 0, same_snd = 0;
+    for (uint64_t k = 1; k + 3 <= FRAMES; k++) held += k % 10 != 5 && pads_held(k, k + 2);
+    for (int h = 1; h <= FRAMES; h++) same_snd += e.snd[h] == a.snd[h];
+    printf("  run-ahead 3: the simulation the same at %d of %d frames, the sound at %d; %d of %d frames shown 3 on, %d of 10 "
+           "as they are; %d waits\n", same_sim(&a, &e), FRAMES, same_snd, onward, held, asis, e.waits);
+    CHECK_EQ(same_sim(&a, &e), FRAMES);
+    CHECK_EQ(same_snd, FRAMES);
+    CHECK_EQ(wanted, FRAMES);
+    CHECK_EQ(back, FRAMES - 10);
+    CHECK_EQ(moved, FRAMES - 10);
+    CHECK_EQ(onward, held);
+    CHECK(held > 20);
+    CHECK_EQ(asis, 10);
+    CHECK_EQ(e.presents, FRAMES); CHECK_EQ(e.audios, FRAMES); CHECK_EQ(e.waits, FRAMES); CHECK_EQ(e.requests, FRAMES);
     mdrt_free(gm);
 
     /* another FM core: other sound, the same simulation */

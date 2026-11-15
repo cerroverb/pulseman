@@ -237,6 +237,27 @@ same on every host for a given build when the client's parts are written the sam
 Netplay is the pad source, and the person playing is still at the platform:
 `mdrt_platform_input(m, buttons)` reads the platform's buttons whatever the pad source.
 
+## Run-ahead
+
+A game's own delay (the frames between a press and the first picture it changes) can be taken
+away by showing the picture of a frame or two further on, run with the buttons as they are, while
+the game itself goes on as without it. The platform says how many frames it wants
+(`mdrt_platform.ahead`; the SDL2 platform's Options page has Run-ahead, 0 to 8, for a client that
+sets `can_run_ahead`, its default `run_ahead`). At a handshake where it wants some, the frame's
+sound and wait go as ever but its picture is held: `mdrt_ahead_wanted(m)` says how many frames.
+At a point it can go on from, the client keeps a state (`mdrt_get_state`), calls `mdrt_ahead(m, n)`
+and plays on: the next `n` handshakes are the frames run ahead, with the pads as the last handshake
+read them, no sound, wait or requests, none drawn but the last, which the `n`-th handshake
+presents. Handshakes after it stay silent until the client puts its state back (`mdrt_set_state`),
+calls `mdrt_ahead(m, 0)` and goes on from the point it kept. Where it cannot keep a state (a load
+under way), `mdrt_present_held(m)` shows the frame as it is; a picture still held at the next
+handshake is shown there. `mdrt_ahead_running(m)` says whether a handshake was one of the frames
+ahead (a client's traces and logs leave those out). The chips are clocked through the frames ahead
+and their samples dropped; the state put back puts everything back, so the simulation, the sound
+and the frames' pacing are those of a run without run-ahead (tests/quiet_test.c). More frames
+ahead than the game's own delay skip the first pictures a press makes. Not online, paused, slowed
+or fast: there the frame shown is the frame.
+
 ## Netplay
 
 `mdrt/netplay.h` plays a game between two to four machines with rollback: each console plays its

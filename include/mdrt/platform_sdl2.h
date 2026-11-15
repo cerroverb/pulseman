@@ -113,6 +113,10 @@ typedef struct mdrt_sdl_options {
      * NULL) hears of each change on the page (which: the option changed), and of the values as
      * the settings file had them (which: -1), and may change the other values (a preset that
      * agrees with them); nonzero when it did. */
+    /* run-ahead (mdrt_ahead): can_run_ahead for a client that runs frames ahead (the Options page's
+     * Run-ahead, 0 to 8; none for one that does not), run_ahead its frames when the settings file
+     * has none (0: off; the game's own delay, for a client that knows it) */
+    int can_run_ahead, run_ahead;
     const char *options_title, *options_note;
     const mdrt_sdl_option *options;
     int noptions;
