@@ -211,7 +211,11 @@ static int menu_player(void *user)
     keys(SDL_SCANCODE_DOWN, 1);
     keys(SDL_SCANCODE_LEFT, 1);                           /* and a shadow mask: off, round to the last) */
     keys(SDL_SCANCODE_DOWN, 2);
-    keys(SDL_SCANCODE_LEFT, 1);                           /* vsync: on (the default) -> off */
+    keys(SDL_SCANCODE_RIGHT, 1);                          /* vsync: off (the default) -> on */
+    keys(SDL_SCANCODE_DOWN, 1);
+    keys(SDL_SCANCODE_RIGHT, 1);                          /* frame pacing: sound -> display (the dummy screen has no rate: the sound's) */
+    keys(SDL_SCANCODE_DOWN, 1);
+    keys(SDL_SCANCODE_RIGHT, 2);                          /* late input: 4 ms */
     keys(SDL_SCANCODE_ESCAPE, 1);
     keys(SDL_SCANCODE_DOWN, 2);
     keys(SDL_SCANCODE_RETURN, 1);                         /* Sound: [Volume, Mute, FM core, FM chip, Low-pass, Back] */
@@ -848,7 +852,8 @@ int main(int argc, char **argv)
     t = slurp(settings_path, &len);
     CHECK(t && strstr(t, "game.rom = roms/other.gen\n") && strstr(t, "video.scale = fit\n") && strstr(t, "pad1.start = Home\n"));
     CHECK(t && strstr(t, "video.upscaler = mmpx4x\n") && strstr(t, "video.colours = console\n") && strstr(t, "video.blend = dither\n"));
-    CHECK(t && strstr(t, "video.scanlines = medium\n") && strstr(t, "video.mask = dot\n") && strstr(t, "video.vsync = off\n"));
+    CHECK(t && strstr(t, "video.scanlines = medium\n") && strstr(t, "video.mask = dot\n") && strstr(t, "video.vsync = on\n"));
+    CHECK(t && strstr(t, "video.pacing = display\n") && strstr(t, "video.late_input = 4\n"));
     CHECK(t && strstr(t, "audio.lowpass = on\n"));
     if (t && mdrt_fm_cores(1)) { char want[64]; snprintf(want, sizeof want, "audio.fm_core = %s\n", mdrt_fm_cores(1)); CHECK(strstr(t, want) != NULL); }
     free(t);
@@ -858,14 +863,14 @@ int main(int argc, char **argv)
     t = slurp(settings_path, &len);
     if (t) {
         static const char *const old[] = { "input.adaptor = none\n", "player1.controller = 1\n", "player3.controller = 3\n",
-                                           "controller.c = b\n", "controller.turbo_b =\n" };
+                                           "controller.c = b\n", "controller.turbo_b =\n", "video.pacing = display\n" };
         for (size_t i = 0; i < sizeof old / sizeof *old; i++) {   /* (made comments; the new values follow) */
             char *at = strstr(t, old[i]);
             if (at) *at = '#';
         }
         char *ed = malloc((size_t)len + 512);
         snprintf(ed, (size_t)len + 512, "%sinput.adaptor = ea4way\nplayer1.controller = 2\nplayer3.controller = 1\ncontroller.c = y\n"
-                 "controller.turbo_b = rightshoulder\n", t);
+                 "controller.turbo_b = rightshoulder\nvideo.pacing = sound\n", t);   /* (turbo counted by the frame: the dummy screen's slow presents would slow them) */
         spit(settings_path, ed);
         free(ed);
     }

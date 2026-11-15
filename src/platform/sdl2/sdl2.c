@@ -96,6 +96,9 @@ static const char *const gif_scale_label[3] = { "1x", "2x", "3x" };
 static const int fast_speeds[6] = { 2, 3, 4, 6, 8, 0 };
 static const char *const fast_label[6] = { "2x", "3x", "4x", "6x", "8x", "max" };
 #define AHEAD_MAX 8
+static const char *const pacing_name[2] = { "sound", "display" };
+#define LATE_MAX 12
+static const char *const late_label[7] = { "off", "2 ms", "4 ms", "6 ms", "8 ms", "10 ms", "12 ms" };
 static const char *const ahead_label[AHEAD_MAX + 1] = { "off", "1 frame", "2 frames", "3 frames", "4 frames", "5 frames", "6 frames", "7 frames", "8 frames" };
 enum { NET_HOST, NET_JOIN, NET_BOTH };
 static const char *const net_role_name[3] = { "host", "join", "both" };
@@ -113,7 +116,7 @@ enum { PAGE_MAIN, PAGE_VIDEO, PAGE_SOUND, PAGE_OPTIONS, PAGE_KEYS, PAGE_ROM, PAG
        PAGE_CLIENT, PAGE_PICK, PAGE_NET };
 enum { SLOT_COUNT = 8 };                                  /* save slots; 0 is the Autosave (where the last run was, kept on quitting) */
 enum { I_RESUME = 1, I_ROM, I_RESET, I_SAVE, I_LOAD, I_VIDEO, I_SOUND, I_OPTIONS, I_KEYS, I_QUIT, I_BACK,
-       I_UPSCALE, I_SCALE, I_ASPECT, I_FULL, I_VSYNC, I_COLOURS, I_BLEND, I_SCANLINES, I_MASK, I_VOLUME, I_MUTE, I_FM_CORE, I_FM_CHIP, I_LOWPASS, I_RUN_AHEAD, I_FAST, I_UP,
+       I_UPSCALE, I_SCALE, I_ASPECT, I_FULL, I_VSYNC, I_COLOURS, I_BLEND, I_SCANLINES, I_MASK, I_VOLUME, I_MUTE, I_FM_CORE, I_FM_CHIP, I_LOWPASS, I_RUN_AHEAD, I_PACING, I_LATE, I_FAST, I_UP,
        I_PLAYERS, I_ADAPTOR, I_TURBO, I_DEADZONE, I_CBUTTONS,
        I_CAPTURE, I_CAP_REPLAY, I_CAP_RECORD, I_CAP_SECONDS, I_CAP_GIFSCALE, I_USE, I_FPS, I_CSECTION,
        I_NET, I_NET_ROLE, I_NET_ADDR, I_NET_PORT, I_NET_DELAY, I_NET_START, I_NET_LEAVE, I_NET_NAME, I_NET_HERE, I_NET_ALL,
@@ -155,6 +158,13 @@ typedef struct sdl {
     SDL_atomic_t fast, slow, step, volume, mute;
     SDL_atomic_t fm_want;       /* 1 + the FM core's index x 2 + the model: for the game thread to make */
     SDL_atomic_t run_ahead;     /* run-ahead's frames (the Options page) */
+    int pacing;                 /* video.pacing: 0 the sound's clock, 1 the display's refresh */
+    SDL_atomic_t by_display;    /* frames paced by the refresh now: pacing 1 and a ~60 Hz screen (the window's thread) */
+    SDL_atomic_t late_ms;       /* video.late_input */
+    SDL_sem *refresh;           /* posted as a frame's present returns (the refresh it was shown at), display pacing */
+    uint64_t last_frame;        /* the performance counter as the last frame began (display pacing's guard) */
+    double pace_mean;           /* display pacing: the frames' mean length lately, in counter ticks */
+    int pace_n;                 /* and how many it is over */
     SDL_atomic_t lowpass_want;  /* 1 + the low-pass (0 off, 1 on): for the game thread to set */
     SDL_GameController *ctrl[SLOTS];   /* the controllers, each in the slot it was given when plugged in */
     const mdrt_sdl_options *o;
@@ -368,7 +378,7 @@ static void audio(void *user, const int16_t *samples, int frames)
         for (size_t i = 0; i < n; i++) s->loud[i] = (int16_t)(samples[i] * vol / 100);
         samples = s->loud;
     }
-    int k = session && s->queued >= (unsigned)s->queue_frames ? stretch(s, samples, frames) : 0;
+    int k = (session || SDL_AtomicGet(&s->by_display)) && s->queued >= (unsigned)s->queue_frames ? stretch(s, samples, frames) : 0;
     if (k) { samples = s->stretched; frames = k; }
     SDL_QueueAudio(s->dev, samples, (Uint32)frames * 4);
     if (++s->queued == (unsigned)s->queue_frames) SDL_PauseAudioDevice(s->dev, 0);   /* start once there is some */
@@ -376,6 +386,7 @@ static void audio(void *user, const int16_t *samples, int frames)
 
 /* run-ahead's frames now: none online (rollback has its own), paused, in the menu, slowed or fast
  * (there the frame shown is the frame) */
+static void check_display(sdl *s);
 static int ahead_frames(void *user)
 {
     sdl *s = user;
@@ -446,6 +457,34 @@ static int frame_wait(void *user)
     int lp = SDL_AtomicSet(&s->lowpass_want, 0);          /* the player's low-pass, between frames */
     if (lp) mdrt_set_lowpass(s->m, lp == 2 ? MDRT_MIX_LOWPASS_MODEL1 : 0);
     int fast = SDL_AtomicGet(&s->fast), slow = SDL_AtomicGet(&s->slow), speed = SDL_AtomicGet(&s->fast_speed);
+    if (s->dev && !fast && !slow && SDL_AtomicGet(&s->by_display) && s->queued >= (unsigned)s->queue_frames) {
+        /* the display: the refresh the last frame was shown at (its present returned), then the
+         * late input's wait; never sooner than 95% of the console's frame after the last (a screen
+         * whose presents do not wait), at most 50 ms */
+        while (SDL_SemValue(s->refresh) > 1) SDL_SemTryWait(s->refresh);
+        SDL_SemWaitTimeout(s->refresh, 50);
+        uint64_t freq = SDL_GetPerformanceFrequency(), now = SDL_GetPerformanceCounter();
+        uint64_t period = freq * mdrt_frame_mclks(s->m) / mdrt_master_clock(s->m);
+        uint64_t until = now + freq * (uint64_t)SDL_AtomicGet(&s->late_ms) / 1000;
+        if (s->last_frame && until < s->last_frame + period * 95 / 100) until = s->last_frame + period * 95 / 100;
+        while ((now = SDL_GetPerformanceCounter()) < until && !ending(s)) {
+            uint64_t ms = (until - now) * 1000 / freq;
+            if (ms > 1) SDL_Delay((Uint32)(ms - 1));
+        }
+        if (s->last_frame) {                              /* (a screen slower than the console: the sound's pacing) */
+            double dt = (double)(now - s->last_frame);
+            s->pace_mean = s->pace_n ? s->pace_mean * 0.95 + dt * 0.05 : dt;
+            if (++s->pace_n > 120 && s->pace_mean > period * 1.02) {
+                fprintf(stderr, "frame pacing: the sound's (the screen's refreshes come every %.1f ms)\n", s->pace_mean * 1000 / freq);
+                SDL_AtomicSet(&s->by_display, 0);
+            }
+        }
+        s->last_frame = now;
+        s->next_tick = 0;
+        return ending(s);
+    }
+    s->last_frame = 0;
+    s->pace_n = 0;
     if (s->dev && !fast && !slow) {                       /* the sound */
         if (s->queued >= (unsigned)s->queue_frames) {
             Uint32 enough = (Uint32)((unsigned)s->queue_frames * s->rate / 60 * 4);
@@ -960,7 +999,10 @@ static void settings_load(sdl *s)
             "# magnification, before the scaling). video.scale: sharp, integer or fit. video.aspect: square or 4:3. video.colours:\n"
             "# standard, full or console (the levels a console puts out). video.blend: off, dither or soft.\n"
             "# video.scanlines: off, light, medium or heavy. video.mask: off, aperture, slot or dot.\n"
-            "# video.vsync: on (frames shown in step with the screen: no tearing) or off.\n"
+            "# video.vsync: off (each frame shown as soon as it is made: the least delay, may tear) or on.\n"
+            "# video.pacing: sound (frames by the sound card's clock) or display (by the screen's refresh, vsync on,\n"
+            "# the sound stretched to follow: a ~60 Hz screen; elsewhere by the sound). video.late_input: milliseconds\n"
+            "# the frame waits after the refresh before reading the controls (display pacing; 0-12).\n"
             "# audio.volume: 0-100.\n"
             "# audio.device: empty for the default. audio.latency: frames of sound queued (1-10).\n"
             "# audio.fm_core: nuked or ymfm. audio.fm_chip: YM2612 or YM3438.\n"
@@ -979,7 +1021,7 @@ static void settings_load(sdl *s)
         { "game.rom", "" },
         { "window.width", "960" }, { "window.height", "672" }, { "window.fullscreen", "0" },
         { "video.upscaler", "off" }, { "video.scale", "sharp" }, { "video.aspect", "square" }, { "video.colours", "standard" },
-        { "video.blend", "off" }, { "video.scanlines", "off" }, { "video.mask", "off" }, { "video.vsync", "on" },
+        { "video.blend", "off" }, { "video.scanlines", "off" }, { "video.mask", "off" }, { "video.vsync", "off" }, { "video.pacing", "sound" }, { "video.late_input", "0" },
         { "audio.volume", "100" }, { "audio.mute", "0" }, { "audio.device", "" }, { "audio.latency", "3" },
         { "audio.fm_core", mdrt_fm_core() }, { "audio.fm_chip", "YM2612" }, { "audio.lowpass", "off" },
         { "general.fast_forward", "4" }, { "general.screenshots", "screenshots" },
@@ -1047,7 +1089,9 @@ static void settings_load(sdl *s)
     s->blend = named(mdrt_settings_get(s->set, "video.blend"), blend_name, MDRT_BLEND_COUNT, MDRT_BLEND_OFF);
     s->scanlines = named(mdrt_settings_get(s->set, "video.scanlines"), scanlines_name, MDRT_SCANLINES_COUNT, MDRT_SCANLINES_OFF);
     s->mask = named(mdrt_settings_get(s->set, "video.mask"), mask_name, MDRT_MASK_COUNT, MDRT_MASK_OFF);
-    s->vsync = named(mdrt_settings_get(s->set, "video.vsync"), off_on, 2, 1);
+    s->vsync = named(mdrt_settings_get(s->set, "video.vsync"), off_on, 2, 0);
+    s->pacing = named(mdrt_settings_get(s->set, "video.pacing"), pacing_name, 2, 0);
+    SDL_AtomicSet(&s->late_ms, clamp(mdrt_settings_get_int(s->set, "video.late_input", 0), 0, LATE_MAX));
     s->aspect = o->aspect ? MDRT_ASPECT_4_3 : named(mdrt_settings_get(s->set, "video.aspect"), aspect_name, 2, MDRT_ASPECT_SQUARE);
     SDL_AtomicSet(&s->volume, clamp(mdrt_settings_get_int(s->set, "audio.volume", 100), 0, 100));
     SDL_AtomicSet(&s->mute, mdrt_settings_get_int(s->set, "audio.mute", 0) != 0);
@@ -1161,7 +1205,7 @@ static void screenshot(sdl *s)
 static void set_vsync(sdl *s)
 {
 #if SDL_VERSION_ATLEAST(2, 0, 18)
-    if (s->ren) SDL_RenderSetVSync(s->ren, s->vsync);
+    if (s->ren) SDL_RenderSetVSync(s->ren, s->vsync || s->pacing);   /* (display pacing: always) */
 #else
     (void)s;
 #endif
@@ -1633,8 +1677,10 @@ static void build_page(sdl *s, int page, int select)
         mdrt_menu_add_choice(m, I_MASK, "Mask", mask_label, MDRT_MASK_COUNT, s->mask);
         mdrt_menu_add_choice(m, I_FULL, "Full screen", off_on, 2, is_fullscreen(s));
         mdrt_menu_add_choice(m, I_VSYNC, "Vsync", off_on, 2, s->vsync);
+        mdrt_menu_add_choice(m, I_PACING, "Frame pacing", pacing_name, 2, s->pacing);
+        mdrt_menu_add_choice(m, I_LATE, "Late input", late_label, LATE_MAX / 2 + 1, SDL_AtomicGet(&s->late_ms) / 2);
         mdrt_menu_add(m, I_BACK, MDRT_ITEM_ACTION, "Back");
-        snprintf(m->subtitle, sizeof m->subtitle, "Sharp: smooth edges. Integer: even pixels. Fit: fills.");
+        snprintf(m->subtitle, sizeof m->subtitle, "Pacing by display: vsync on, ~60 Hz screens. Late input: its controls read later.");
         break;
     case PAGE_CLIENT: {                                   /* a page of the client's own options */
         mdrt_sdl_page cp = client_page(s, s->cpage);
@@ -2263,6 +2309,16 @@ static void act(sdl *s, int id)
         set_vsync(s);
         mdrt_settings_set(s->set, "video.vsync", off_on[s->vsync]);
         return;
+    case I_PACING:
+        s->pacing = it->value;
+        set_vsync(s);
+        check_display(s);
+        mdrt_settings_set(s->set, "video.pacing", pacing_name[s->pacing]);
+        return;
+    case I_LATE:
+        SDL_AtomicSet(&s->late_ms, it->value * 2);
+        mdrt_settings_set_int(s->set, "video.late_input", it->value * 2);
+        return;
     case I_VOLUME:
         SDL_AtomicSet(&s->volume, it->value);
         mdrt_settings_set_int(s->set, "audio.volume", it->value);
@@ -2590,7 +2646,7 @@ static void say_draw(sdl *s, const SDL_Rect *dst, int cols, int lines)
 
 /* the game's frame through the looks: blended, upscaled, scaled to the window, then the tube's
  * scanlines and mask multiplied in and the picture added again at their lift (the menu: as it is) */
-static void draw(sdl *s)
+static int draw(sdl *s)
 {
     int game = !s->menu_open, method = game ? s->upscale : MDRT_UPSCALE_OFF, blend = game ? s->blend : MDRT_BLEND_OFF;
     int tube = game && mdrt_look_tube(s->scanlines, s->mask);
@@ -2608,7 +2664,7 @@ static void draw(sdl *s)
     } else if (fresh) SDL_UpdateTexture(s->tex, NULL, s->picture, 320 * 4);
     s->fresh = 0;
     SDL_UnlockMutex(s->lock);
-    if ((!fresh && !s->redraw) || (!w && !s->menu_open)) return;
+    if ((!fresh && !s->redraw) || (!w && !s->menu_open)) return 0;
     SDL_Texture *tex = s->tex;
     int cols = w, lines = h;                              /* (the picture's own size, for the scanlines) */
     if (s->menu_open) {
@@ -2672,6 +2728,19 @@ static void draw(sdl *s)
     if (s->show_fps && game) fps_draw(s, &dst, cols, lines);
     if (game) say_draw(s, &dst, cols, lines);
     SDL_RenderPresent(s->ren);
+    return fresh && game;
+}
+
+/* display pacing: on when chosen and the window's screen refreshes at about the console's rate
+ * (59 to 61 Hz; a screen of another rate keeps the sound's pacing); said once on stderr */
+static void check_display(sdl *s)
+{
+    SDL_DisplayMode mode;
+    int hz = s->win && SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(s->win), &mode) == 0 ? mode.refresh_rate : 0;
+    int on = s->pacing && hz >= 59 && hz <= 61;
+    if (on != SDL_AtomicGet(&s->by_display) || (s->pacing && !on))
+        fprintf(stderr, "frame pacing: %s\n", on ? "the display's refresh" : s->pacing ? "the sound's (the screen is not ~60 Hz)" : "the sound's");
+    SDL_AtomicSet(&s->by_display, on);
 }
 
 static void window_event(sdl *s, const SDL_WindowEvent *e)
@@ -2689,6 +2758,7 @@ static void window_event(sdl *s, const SDL_WindowEvent *e)
         s->redraw = 1;
         break;
     case SDL_WINDOWEVENT_MOVED:
+        check_display(s);                                 /* (another screen, another rate) */
         if (!full) {
             mdrt_settings_set_int(s->set, "window.x", e->data1);
             mdrt_settings_set_int(s->set, "window.y", e->data2);
@@ -2973,12 +3043,13 @@ int mdrt_sdl_run(mdrt_config *cfg, const mdrt_sdl_options *o, mdrt_game_fn game,
     Uint32 flags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
     if (mdrt_settings_get_int(s->set, "window.fullscreen", 0)) flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
     s->win = SDL_CreateWindow(o->title ? o->title : "pulseman", x, y, w, h, flags);
-    Uint32 vs = s->vsync ? SDL_RENDERER_PRESENTVSYNC : 0;
+    Uint32 vs = s->vsync || s->pacing ? SDL_RENDERER_PRESENTVSYNC : 0;
     s->ren = s->win ? SDL_CreateRenderer(s->win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_TARGETTEXTURE | vs) : NULL;
     if (s->win && !s->ren) s->ren = SDL_CreateRenderer(s->win, -1, SDL_RENDERER_ACCELERATED | vs);
     if (s->win && !s->ren) s->ren = SDL_CreateRenderer(s->win, -1, SDL_RENDERER_SOFTWARE);   /* no GPU */
     set_vsync(s);
     s->frame_event = SDL_RegisterEvents(1);
+    check_display(s);
     s->tex = s->ren ? SDL_CreateTexture(s->ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, 320, 240) : NULL;
     if (!s->tex) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); SDL_Quit(); return 1; }
     s->targets = SDL_RenderTargetSupported(s->ren);
@@ -2993,6 +3064,7 @@ int mdrt_sdl_run(mdrt_config *cfg, const mdrt_sdl_options *o, mdrt_game_fn game,
     cfg->audio_rate = s->rate;
     for (int i = 0; i < SDL_NumJoysticks(); i++) ctrl_added(s, i);
     s->lock = SDL_CreateMutex();
+    s->refresh = SDL_CreateSemaphore(0);
     s->cap_lock = SDL_CreateMutex();
     s->save_lock = SDL_CreateMutex();
     s->cap = mdrt_capture_new(0);
@@ -3034,7 +3106,7 @@ int mdrt_sdl_run(mdrt_config *cfg, const mdrt_sdl_options *o, mdrt_game_fn game,
         } while (SDL_PollEvent(&e));
         if (s->thread && SDL_AtomicGet(&s->done) && !SDL_AtomicGet(&s->stop)) break;   /* the game ended by itself */
         read_buttons(s);
-        draw(s);
+        if (draw(s) && SDL_AtomicGet(&s->by_display)) SDL_SemPost(s->refresh);   /* (shown: its refresh came) */
         check_pending(s);
         show_note(s);
         check_saves(s, 0);

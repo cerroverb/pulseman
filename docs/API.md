@@ -24,7 +24,10 @@ started from the Finder runs in `/`, where nothing can be written, so a game cal
 `~/Library/Application Support/APP` (made if need be). Run from a shell, outside a bundle and on
 the other systems, it leaves the working directory alone. It writes the file with
 every setting the first time and whenever the player changes one: the window's size, place and full
-screen, vsync, the scaling (sharp, integer, fit) and aspect (square pixels, 4:3), the volume, mute,
+screen, vsync (off by default), frame pacing (by the sound card's clock, or by a ~60 Hz screen's
+refresh with vsync, the sound stretched by half a per cent at most to follow, back to the sound's
+when the refreshes come slower than the console's frames; and late input, the milliseconds a frame
+waits after the refresh before reading the controls), the scaling (sharp, integer, fit) and aspect (square pixels, 4:3), the volume, mute,
 sound device and latency, fast-forward's speed, the FPS counter at the picture's top right (the
 Options page; off by default), the screenshots'
 directory and every key of both pads and of the player's controls (on the function
