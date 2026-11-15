@@ -1,5 +1,6 @@
 /* The mixer: the PSG at its gain against the FM, the DC blocker, the resampler (a tone keeps
- * its pitch and level, one above the output's Nyquist frequency is gone), the output's length. */
+ * its pitch and level, one above the output's Nyquist frequency is gone), the output's length,
+ * the console's low-pass (BlastEm's coefficient, a one-pole filter's response). */
 #include <math.h>
 #include <stdlib.h>
 #include "check.h"
@@ -17,6 +18,8 @@ static int16_t fm[2 * N], psg[N], out[2 * 50000];
 
 /* one second of a tone at hz, amplitude a, on the FM's left (psg 0) or the PSG (psg 1) */
 /* (the FM's gain is above 1: the levels below are taken back to the input's) */
+static uint32_t lowpass;                                  /* (the low-pass for the runs: 0 off) */
+
 static int run_with(uint32_t rate, double hz, double a, int to_psg, int dc, uint32_t clock, int32_t fm_gain)
 {
     for (int i = 0; i < N; i++) {
@@ -28,6 +31,7 @@ static int run_with(uint32_t rate, double hz, double a, int to_psg, int dc, uint
     mdrt_mix_init(&m, rate);
     if (clock) mdrt_mix_set_clock(&m, clock);
     if (fm_gain) mdrt_mix_set_gains(&m, fm_gain, MDRT_MIX_PSG_GAIN);
+    mdrt_mix_set_lowpass(&m, lowpass);
     return mdrt_mix_run(&m, fm, psg, N, out);
 }
 
@@ -62,9 +66,41 @@ static void pal_and_gains(void)
     CHECK(fabs(level - 10000) < 50);
 }
 
+/* the low-pass: BlastEm's coefficient (render_audio.c: (int32_t)(0x10000 * dt / (dt + RC))) on
+ * both consoles; tones at a one-pole filter's gain, a / |1 - (1 - a) e^-jw|; off, the same as none */
+static void low_pass(void)
+{
+    static const uint32_t clocks[] = { MDRT_MASTER_CLOCK_NTSC, MDRT_MASTER_CLOCK_PAL };
+    for (int c = 0; c < 2; c++) {
+        mdrt_mix m;
+        mdrt_mix_init(&m, 48000);
+        mdrt_mix_set_clock(&m, clocks[c]);
+        mdrt_mix_set_lowpass(&m, MDRT_MIX_LOWPASS_MODEL1);
+        double dt = 1008.0 / clocks[c], rc = 1.0 / MDRT_MIX_LOWPASS_MODEL1 / (2 * M_PI);
+        printf("  low-pass coefficient %d (BlastEm's %d)\n", m.lp_alpha, (int32_t)(65536 * (dt / (dt + rc))));
+        CHECK(m.lp_alpha == (int32_t)(65536 * (dt / (dt + rc))));
+        mdrt_mix_set_lowpass(&m, 0);
+        CHECK(m.lp_alpha == 0);
+    }
+    static const double tones[] = { 300, 1000, 3390, 8000, 15000 };
+    for (int t = 0; t < 5; t++) {
+        lowpass = MDRT_MIX_LOWPASS_MODEL1;
+        int n = run(48000, tones[t], 10000, 0, 0);
+        double on = rms(0, 4800, n);
+        lowpass = 0;
+        n = run(48000, tones[t], 10000, 0, 0);
+        double off = rms(0, 4800, n), a = 18720 / 65536.0, w = 2 * M_PI * tones[t] / IN_RATE;
+        double want = 20 * log10(a / sqrt(pow(1 - (1 - a) * cos(w), 2) + pow((1 - a) * sin(w), 2)));
+        printf("  low-pass: %.0f Hz at %.2f dB (a one-pole filter's %.2f dB)\n", tones[t], 20 * log10(on / off), want);
+        CHECK(fabs(20 * log10(on / off) - want) < 0.05);
+    }
+    lowpass = 0;
+}
+
 int main(void)
 {
     pal_and_gains();
+    low_pass();
     static const uint32_t rates[] = { 48000, 44100, 32000 };
     for (size_t r = 0; r < 3; r++) {
         uint32_t rate = rates[r];

@@ -6,7 +6,7 @@
  * runs in, with its comment and an unknown key; run again, keys bound in that file by hand; and
  * the menu: a ROM chosen in its browser (one the client turns down first), the upscaler (MMPX 4x
  * from then on, and on the next start) and the looks (the console's colours, dithering blended,
- * scanlines and a shadow mask, from then on too), the scaling and FM chip
+ * scanlines and a shadow mask, from then on too), the scaling, the FM chip and the low-pass
  * changed, a reset, another ROM while playing, a key changed by pressing it, and the ROM chosen
  * last found again on the next start; and four players: EA's 4 Way Play in the ports, two virtual
  * controllers given to players 1 and 3, a button moved, a turbo button, the stick's dead zone, a
@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "check.h"
+#include "mdrt/mix.h"
 #include "mdrt/platform_sdl2.h"
 #include "mdrt/gif.h"
 #include "mdrt/png.h"
@@ -41,7 +42,7 @@
 #define BACKDROP 0x0E42                                   /* the picture: the backdrop's colour */
 
 static const char *const shots = "shots", *const sound = "sound.raw", *const settings_path = "settings.ini";
-static SDL_atomic_t frame, held, starts, fm_second, pads4[MDRT_PADS], adaptor, game_frame, refuse_saves, opt_seen[5], opt_uses, opt_read, text_asked[2], text_share, picks;
+static SDL_atomic_t frame, held, starts, fm_second, lowpass_on, pads4[MDRT_PADS], adaptor, game_frame, refuse_saves, opt_seen[5], opt_uses, opt_read, text_asked[2], text_share, picks;
 static int run;
 static char rom_seen[16];                                 /* the start of the ROM the client was given */
 
@@ -213,13 +214,17 @@ static int menu_player(void *user)
     keys(SDL_SCANCODE_LEFT, 1);                           /* vsync: on (the default) -> off */
     keys(SDL_SCANCODE_ESCAPE, 1);
     keys(SDL_SCANCODE_DOWN, 2);
-    keys(SDL_SCANCODE_RETURN, 1);                         /* Sound: [Volume, Mute, FM core, FM chip, Back] */
+    keys(SDL_SCANCODE_RETURN, 1);                         /* Sound: [Volume, Mute, FM core, FM chip, Low-pass, Back] */
+    CHECK_EQ(SDL_AtomicGet(&lowpass_on), 0);              /* (off by default) */
     keys(SDL_SCANCODE_DOWN, 2);
     keys(SDL_SCANCODE_RIGHT, 1);                          /* the next FM core */
+    keys(SDL_SCANCODE_DOWN, 2);
+    keys(SDL_SCANCODE_RIGHT, 1);                          /* the low-pass on */
     keys(SDL_SCANCODE_ESCAPE, 2);                         /* back, and out */
     SDL_Delay(300);
     CHECK(SDL_AtomicGet(&frame) > f0 + 5);
     CHECK_EQ(SDL_AtomicGet(&fm_second), mdrt_fm_cores(1) != NULL);   /* (changed between frames) */
+    CHECK_EQ(SDL_AtomicGet(&lowpass_on), MDRT_MIX_LOWPASS_MODEL1);   /* (set between frames, while playing) */
     keys(SDL_SCANCODE_ESCAPE, 1);
     keys(SDL_SCANCODE_DOWN, 2);
     keys(SDL_SCANCODE_RETURN, 1);                         /* Reset: chosen once, asked again */
@@ -649,6 +654,7 @@ static void game(mdrt *m, void *user)
         for (int p = 0; p < MDRT_PADS; p++) SDL_AtomicSet(&pads4[p], mdrt_get_pads(m)->buttons[p]);
         SDL_AtomicSet(&adaptor, mdrt_get_pads(m)->adaptor);
         SDL_AtomicSet(&fm_second, mdrt_fm_cores(1) && !strcmp(mdrt_fm_core_of(mdrt_get_fm(m)), mdrt_fm_cores(1)));
+        SDL_AtomicSet(&lowpass_on, (int)mdrt_lowpass(m));
         SDL_AtomicAdd(&frame, 1);
     }
     if (t) SDL_WaitThread(t, NULL);
@@ -771,7 +777,7 @@ static void check_settings(void)
         "# the test's own comment\n", "mystery.key = kept\n", "general.screenshots = shots\n", "general.fast_forward = 4\n",
         "audio.volume = 80\n", "audio.mute = 1\n", "video.scale = integer\n", "video.aspect = square\n",
         "pad1.start = Return\n", "pad2.a = Q\n", "key.screenshot = F12\n", "key.slow_motion = F7\n", "key.pause = F5\n", "key.save_replay = F10\n", "key.record = F11\n", "key.mute = F1\n",
-        "key.menu = Escape\n", "game.rom =\n",
+        "key.menu = Escape\n", "game.rom =\n", "audio.lowpass = off\n",
     };
     for (size_t i = 0; i < sizeof want / sizeof *want; i++)
         if (!strstr(t, want[i])) { printf("  settings: no \"%s\"\n", want[i]); CHECK(0); }
@@ -843,6 +849,7 @@ int main(int argc, char **argv)
     CHECK(t && strstr(t, "game.rom = roms/other.gen\n") && strstr(t, "video.scale = fit\n") && strstr(t, "pad1.start = Home\n"));
     CHECK(t && strstr(t, "video.upscaler = mmpx4x\n") && strstr(t, "video.colours = console\n") && strstr(t, "video.blend = dither\n"));
     CHECK(t && strstr(t, "video.scanlines = medium\n") && strstr(t, "video.mask = dot\n") && strstr(t, "video.vsync = off\n"));
+    CHECK(t && strstr(t, "audio.lowpass = on\n"));
     if (t && mdrt_fm_cores(1)) { char want[64]; snprintf(want, sizeof want, "audio.fm_core = %s\n", mdrt_fm_cores(1)); CHECK(strstr(t, want) != NULL); }
     free(t);
     run = 4;

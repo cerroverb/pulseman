@@ -68,6 +68,7 @@ typedef struct mdrt_config {
     int fm_model;               /* MDRT_FM_YM2612 (0: the first consoles) or MDRT_FM_YM3438 (later ones) */
     uint32_t audio_rate;        /* output samples a second (0: 48000) */
     int32_t fm_gain, psg_gain;  /* the mixer's gains in 1/32768ths (0: MDRT_MIX_FM_GAIN / PSG_GAIN) */
+    uint32_t lowpass_hz;        /* the console's low-pass on the output, its cutoff (0: off; mdrt_set_lowpass) */
     size_t sram_size;           /* save RAM bytes (0: none) */
     mdrt_read8_fn read68k;      /* the 68k's memory, for DMA */
     void *read68k_user;
@@ -93,6 +94,11 @@ mdrt_fm *mdrt_get_fm(mdrt *m);                  /* (its core and model: mdrt_fm_
  * model, given the registers the old chip had. Notes sounding stop until their next key-on. 0, or
  * -1 when the build has no such core (nothing changed). The player's choice in the SDL2 menu. */
 int mdrt_set_fm(mdrt *m, const char *core, int model);
+/* the console's low-pass on the sound, its cutoff in Hz (0: off; MDRT_MIX_LOWPASS_MODEL1, 3390, a
+ * Model 1's as BlastEm has it), on the game's thread between frames; presentation only (the
+ * simulation and its states are the same either way). The player's choice in the SDL2 menu. */
+void mdrt_set_lowpass(mdrt *m, uint32_t hz);
+uint32_t mdrt_lowpass(const mdrt *m);
 
 /* the master clock in Hz, the frame's length in master clocks (896040 NTSC, 1070460 PAL) and
  * frames completed */

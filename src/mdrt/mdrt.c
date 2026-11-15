@@ -111,6 +111,7 @@ mdrt *mdrt_new(const mdrt_config *c)
     mdrt_mix_init(&m->mix, m->cfg.audio_rate);
     mdrt_mix_set_clock(&m->mix, master_clock(m));
     mdrt_mix_set_gains(&m->mix, c->fm_gain ? c->fm_gain : MDRT_MIX_FM_GAIN, c->psg_gain ? c->psg_gain : MDRT_MIX_PSG_GAIN);
+    mdrt_mix_set_lowpass(&m->mix, c->lowpass_hz);
     mdrt_pads_init(&m->pads, !c->domestic, c->pal);
     mdrt_sram_init(&m->sram, c->sram_size);
     size_t samples = m->frame / MDRT_FM_SAMPLE_MCLKS + 4;
@@ -134,6 +135,14 @@ void mdrt_free(mdrt *m)
     free(m);
 }
 
+void mdrt_set_lowpass(mdrt *m, uint32_t hz)
+{
+    m->cfg.lowpass_hz = hz;
+    mdrt_mix_set_lowpass(&m->mix, hz);
+}
+
+uint32_t mdrt_lowpass(const mdrt *m) { return m->cfg.lowpass_hz; }
+
 void mdrt_power_on(mdrt *m)
 {
     mdrt_hv_fn hv = m->vdp.hv;                            /* (the client's HV source, or the beam's) */
@@ -148,6 +157,7 @@ void mdrt_power_on(mdrt *m)
     mdrt_mix_init(&m->mix, m->cfg.audio_rate);
     mdrt_mix_set_clock(&m->mix, master_clock(m));
     mdrt_mix_set_gains(&m->mix, m->cfg.fm_gain ? m->cfg.fm_gain : MDRT_MIX_FM_GAIN, m->cfg.psg_gain ? m->cfg.psg_gain : MDRT_MIX_PSG_GAIN);
+    mdrt_mix_set_lowpass(&m->mix, m->cfg.lowpass_hz);
     mdrt_pads kept = m->pads;                             /* (the ports' devices stay plugged in) */
     mdrt_pads_init(&m->pads, !m->cfg.domestic, m->cfg.pal);
     memcpy(m->pads.type, kept.type, sizeof kept.type);
@@ -663,6 +673,7 @@ static int load_sections(mdrt *m, const uint8_t *data[], const size_t len[])
         mdrt_mix_init(&m->mix, m->cfg.audio_rate);
         mdrt_mix_set_clock(&m->mix, ck);
         mdrt_mix_set_gains(&m->mix, fg, pg);
+        mdrt_mix_set_lowpass(&m->mix, m->cfg.lowpass_hz);
     }
     m->nev = nev;
     for (uint32_t i = 0; i < nev; i++) {

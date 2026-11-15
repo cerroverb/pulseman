@@ -19,7 +19,16 @@ void mdrt_mix_init(mdrt_mix *m, uint32_t rate)
     m->psg_gain = MDRT_MIX_PSG_GAIN;
 }
 
-void mdrt_mix_set_clock(mdrt_mix *m, uint32_t master_clock) { m->clock = master_clock; }
+/* a = dt / (dt + RC) = k / (k + clock), k = 1008 x 2 pi x hz (2 pi in millionths), in 1/65536ths
+ * rounded down as BlastEm's: 18720 for 3390 Hz on an NTSC console */
+static void lowpass_alpha(mdrt_mix *m)
+{
+    uint64_t k = (uint64_t)IN_MCLKS * m->lp_hz * 6283185u;
+    m->lp_alpha = m->lp_hz ? (int32_t)((k << 16) / (k + (uint64_t)m->clock * 1000000u)) : 0;
+}
+
+void mdrt_mix_set_clock(mdrt_mix *m, uint32_t master_clock) { m->clock = master_clock; lowpass_alpha(m); }
+void mdrt_mix_set_lowpass(mdrt_mix *m, uint32_t hz) { m->lp_hz = hz; lowpass_alpha(m); }
 void mdrt_mix_set_gains(mdrt_mix *m, int32_t fm_gain, int32_t psg_gain) { m->fm_gain = fm_gain; m->psg_gain = psg_gain; }
 
 int mdrt_mix_run(mdrt_mix *m, const int16_t *fm, const int16_t *psg, int n, int16_t *out)
@@ -32,7 +41,11 @@ int mdrt_mix_run(mdrt_mix *m, const int16_t *fm, const int16_t *psg, int n, int1
             int32_t x = (int32_t)(((fm ? (int64_t)fm[2 * i + c] * m->fm_gain : 0) + p) / 32768);
             m->dc_y[c] = (int64_t)(x - m->dc_x[c]) * 65536 + ((m->dc_y[c] * DC_A) >> 16);
             m->dc_x[c] = x;
-            m->hist[c][m->in & 63] = (int32_t)(m->dc_y[c] >> 16);
+            int32_t y = (int32_t)(m->dc_y[c] >> 16);
+            if (m->lp_alpha)                              /* (the console's low-pass: BlastEm's lowpass_sample) */
+                y = (int32_t)(((int64_t)y * m->lp_alpha + (int64_t)m->lp_y[c] * (65536 - m->lp_alpha)) >> 16);
+            m->lp_y[c] = y;
+            m->hist[c][m->in & 63] = y;
         }
         m->in++;
         for (;;) {                                        /* the outputs the inputs now reach */
@@ -62,6 +75,7 @@ size_t mdrt_mix_save(const mdrt_mix *m, uint8_t *out)
     st_u32s(&o, m->hist[0], 64); st_u32s(&o, m->hist[1], 64);
     st_u32s(&o, m->dc_x, 2);
     st_u64(&o, (uint64_t)m->dc_y[0]); st_u64(&o, (uint64_t)m->dc_y[1]);
+    st_u32s(&o, m->lp_y, 2);                              /* (the cutoff is the player's setting, not the state's) */
     return o.n;
 }
 
@@ -75,5 +89,7 @@ int mdrt_mix_load(mdrt_mix *m, const uint8_t *in, size_t size)
     st_g32s(&i, m->hist[0], 64); st_g32s(&i, m->hist[1], 64);
     st_g32s(&i, m->dc_x, 2);
     m->dc_y[0] = (int64_t)st_g64(&i); m->dc_y[1] = (int64_t)st_g64(&i);
+    st_g32s(&i, m->lp_y, 2);
+    lowpass_alpha(m);
     return 0;
 }

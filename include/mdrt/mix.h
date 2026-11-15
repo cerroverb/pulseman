@@ -1,8 +1,9 @@
 /* The mixer: the FM chip's stereo samples and the PSG's mono ones (both at the YM2612's rate, 1008
  * master clocks a sample) added at the console's balance and level (as the oracle mixes them), the
  * DC taken out (the output capacitor's job on the
- * hardware: the FM chip's DAC sits a step above zero), resampled to the output rate with a
- * 20 kHz low-pass. Integer arithmetic only: the same samples on every host. */
+ * hardware: the FM chip's DAC sits a step above zero), optionally through the console's own
+ * low-pass (mdrt_mix_set_lowpass), resampled to the output rate with a 20 kHz low-pass. Integer
+ * arithmetic only: the same samples on every host. */
 #ifndef MDRT_MIX_H
 #define MDRT_MIX_H
 #include <stddef.h>
@@ -22,13 +23,23 @@ typedef struct mdrt_mix {
     int32_t hist[2][64];        /* the last input samples (after the DC blocker), by index mod 64 */
     int32_t dc_x[2];            /* the DC blocker's last input */
     int64_t dc_y[2];            /* and output, in 1/65536ths */
+    uint32_t lp_hz;             /* the low-pass's cutoff (0: off) */
+    int32_t lp_alpha;           /* its coefficient in 1/65536ths, from the cutoff and the clock */
+    int32_t lp_y[2];            /* its last output (while off: the last input) */
 } mdrt_mix;
+
+/* the low-pass of a Model 1 console's output, as BlastEm has it by default (its "3390 Hz (Model 1)") */
+#define MDRT_MIX_LOWPASS_MODEL1 3390
 
 void mdrt_mix_init(mdrt_mix *m, uint32_t rate);
 /* the console's master clock (MDRT_MASTER_CLOCK_NTSC by default, or _PAL): the input's rate */
 void mdrt_mix_set_clock(mdrt_mix *m, uint32_t master_clock);
 /* the FM and PSG gains in 1/32768ths (MDRT_MIX_FM_GAIN / PSG_GAIN by default; consoles differ) */
 void mdrt_mix_set_gains(mdrt_mix *m, int32_t fm_gain, int32_t psg_gain);
+/* the console's low-pass on the output: a one-pole filter (an RC) with its cutoff at hz (0: off,
+ * the default), BlastEm's: y = a x + (1 - a) y', a = dt / (dt + RC), dt an input sample, RC =
+ * 1 / (2 pi hz) (render_audio.c). Kept by mdrt_mix_set_clock; may change between any two runs. */
+void mdrt_mix_set_lowpass(mdrt_mix *m, uint32_t hz);
 /* n input samples: fm (left, right pairs; NULL for silence) and psg (mono; NULL for silence); the
  * output samples they complete (left, right pairs) go to out; returns how many. out has room for
  * n * rate / 53267 + 2 of them. The output is 16 input samples (0.3 ms) late. */

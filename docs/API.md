@@ -34,7 +34,7 @@ picture) and `aspect` (4:3) set this run's window over the settings'.
 Esc opens the platform's menu (a controller's Back or Guide button too), drawn over the picture
 at the console's resolution while the game waits in `mdrt_wait_vblank`: the game's ROM, a reset,
 a state saved or loaded, the video, the sound (with the FM core and chip, changed as the game
-plays: `mdrt_set_fm`), options and every key. A client that runs a ROM gives the platform
+plays: `mdrt_set_fm`; and the low-pass, off by default: `mdrt_set_lowpass`), options and every key. A client that runs a ROM gives the platform
 `rom_check` (are these bytes a ROM the game can run, or why not, in a few words) and `rom_use`
 (the ROM, before the game starts), and `rom_path` (the command line's) and `rom_default`: the
 platform reads the file, keeps the bytes, remembers the one the player chose in the settings and,
@@ -83,7 +83,10 @@ console with `mdrt_new(&c)` and call the game yourself.
 Other settings: `c.pal` makes a PAL console (its master clock, 53,203,424 Hz, 313 lines a frame,
 the version register's PAL bit; V30 when register 1 asks for it); `c.fm_gain` and `c.psg_gain`
 set the mixer's balance in 1/32768ths (0 keeps the defaults, fitted to the oracle; consoles
-differ by model).
+differ by model). `c.lowpass_hz` puts the console's low-pass on the output: a one-pole
+filter with its cutoff there, as BlastEm's (`MDRT_MIX_LOWPASS_MODEL1`, 3,390 Hz, a Model 1's, its
+default); 0, the default here, leaves the sound as the chips make it. `mdrt_set_lowpass` changes
+it between frames. It shapes the sound only: the simulation and its hash are the same either way.
 
 ## Threads
 

@@ -23,6 +23,7 @@
 #include "mdrt/capture.h"
 #include "mdrt/look.h"
 #include "mdrt/menu.h"
+#include "mdrt/mix.h"
 #include "mdrt/net_udp.h"
 #include "mdrt/platform_sdl2.h"
 #include "mdrt/png.h"
@@ -110,7 +111,7 @@ enum { PAGE_MAIN, PAGE_VIDEO, PAGE_SOUND, PAGE_OPTIONS, PAGE_KEYS, PAGE_ROM, PAG
        PAGE_CLIENT, PAGE_PICK, PAGE_NET };
 enum { SLOT_COUNT = 8 };                                  /* save slots; 0 is the Autosave (where the last run was, kept on quitting) */
 enum { I_RESUME = 1, I_ROM, I_RESET, I_SAVE, I_LOAD, I_VIDEO, I_SOUND, I_OPTIONS, I_KEYS, I_QUIT, I_BACK,
-       I_UPSCALE, I_SCALE, I_ASPECT, I_FULL, I_VSYNC, I_COLOURS, I_BLEND, I_SCANLINES, I_MASK, I_VOLUME, I_MUTE, I_FM_CORE, I_FM_CHIP, I_FAST, I_UP,
+       I_UPSCALE, I_SCALE, I_ASPECT, I_FULL, I_VSYNC, I_COLOURS, I_BLEND, I_SCANLINES, I_MASK, I_VOLUME, I_MUTE, I_FM_CORE, I_FM_CHIP, I_LOWPASS, I_FAST, I_UP,
        I_PLAYERS, I_ADAPTOR, I_TURBO, I_DEADZONE, I_CBUTTONS,
        I_CAPTURE, I_CAP_REPLAY, I_CAP_RECORD, I_CAP_SECONDS, I_CAP_GIFSCALE, I_USE, I_FPS, I_CSECTION,
        I_NET, I_NET_ROLE, I_NET_ADDR, I_NET_PORT, I_NET_DELAY, I_NET_START, I_NET_LEAVE, I_NET_NAME, I_NET_HERE, I_NET_ALL,
@@ -151,6 +152,7 @@ typedef struct sdl {
     SDL_atomic_t saves, loads, rewind;      /* presses of the state keys since the game last asked; held */
     SDL_atomic_t fast, slow, step, volume, mute;
     SDL_atomic_t fm_want;       /* 1 + the FM core's index x 2 + the model: for the game thread to make */
+    SDL_atomic_t lowpass_want;  /* 1 + the low-pass (0 off, 1 on): for the game thread to set */
     SDL_GameController *ctrl[SLOTS];   /* the controllers, each in the slot it was given when plugged in */
     const mdrt_sdl_options *o;
     mdrt_config *cfg;
@@ -429,6 +431,8 @@ static int frame_wait(void *user)
     }
     int fm = SDL_AtomicSet(&s->fm_want, 0);               /* the player's FM chip, between frames */
     if (fm) mdrt_set_fm(s->m, mdrt_fm_cores((fm - 1) / 2), (fm - 1) % 2);
+    int lp = SDL_AtomicSet(&s->lowpass_want, 0);          /* the player's low-pass, between frames */
+    if (lp) mdrt_set_lowpass(s->m, lp == 2 ? MDRT_MIX_LOWPASS_MODEL1 : 0);
     int fast = SDL_AtomicGet(&s->fast), slow = SDL_AtomicGet(&s->slow), speed = SDL_AtomicGet(&s->fast_speed);
     if (s->dev && !fast && !slow) {                       /* the sound */
         if (s->queued >= (unsigned)s->queue_frames) {
@@ -579,6 +583,7 @@ static int start_game(sdl *s)
     SDL_AtomicSet(&s->done, 0);
     SDL_AtomicSet(&s->stop, 0);
     SDL_AtomicSet(&s->fm_want, 0);
+    SDL_AtomicSet(&s->lowpass_want, 0);
     s->thread = SDL_CreateThread(game_thread, "game", s);
     if (!s->thread) { mdrt_free(s->m); s->m = NULL; }
     return s->thread != NULL;
@@ -907,9 +912,11 @@ static void option_shown(sdl *s, mdrt_menu *m, int i, int v)
     else snprintf(it->detail, sizeof it->detail, "%d%s", v, op->unit ? op->unit : "");
 }
 
-/* the FM core and chip a console is made with: the client's, else the settings' */
+/* the FM core and chip a console is made with, and its low-pass: the client's, else the settings' */
 static void fm_from_settings(sdl *s)
 {
+    if (!s->cfg->lowpass_hz && named(mdrt_settings_get(s->set, "audio.lowpass"), off_on, 2, 0))
+        s->cfg->lowpass_hz = MDRT_MIX_LOWPASS_MODEL1;
     if (s->cfg->fm_core) return;
     const char *want = mdrt_settings_get(s->set, "audio.fm_core");
     for (int i = 0; mdrt_fm_cores(i); i++) if (want && !strcmp(want, mdrt_fm_cores(i))) s->cfg->fm_core = mdrt_fm_cores(i);
@@ -945,6 +952,7 @@ static void settings_load(sdl *s)
             "# audio.volume: 0-100.\n"
             "# audio.device: empty for the default. audio.latency: frames of sound queued (1-10).\n"
             "# audio.fm_core: nuked or ymfm. audio.fm_chip: YM2612 or YM3438.\n"
+            "# audio.lowpass: off or on (a Model 1 console's low-pass on the sound: 3390 Hz, as BlastEm has it).\n"
             "# general.fast_forward: times the speed while it is held (0: as fast as it goes).\n"
             "# capture.replay: the seconds kept for the replay (0: off). capture.gif_scale: 1-3. A\n"
             "# control's key may have Shift+, Ctrl+ or Alt+ before it.\n"
@@ -959,7 +967,7 @@ static void settings_load(sdl *s)
         { "video.upscaler", "off" }, { "video.scale", "sharp" }, { "video.aspect", "square" }, { "video.colours", "standard" },
         { "video.blend", "off" }, { "video.scanlines", "off" }, { "video.mask", "off" }, { "video.vsync", "on" },
         { "audio.volume", "100" }, { "audio.mute", "0" }, { "audio.device", "" }, { "audio.latency", "3" },
-        { "audio.fm_core", mdrt_fm_core() }, { "audio.fm_chip", "YM2612" },
+        { "audio.fm_core", mdrt_fm_core() }, { "audio.fm_chip", "YM2612" }, { "audio.lowpass", "off" },
         { "general.fast_forward", "4" }, { "general.screenshots", "screenshots" },
     };
     for (size_t i = 0; i < sizeof defaults / sizeof *defaults; i++) mdrt_settings_default(s->set, defaults[i][0], defaults[i][1]);
@@ -1655,8 +1663,9 @@ static void build_page(sdl *s, int page, int select)
         for (int i = 0; i < s->ncores; i++) if (s->cfg->fm_core && !strcmp(s->cfg->fm_core, mdrt_fm_cores(i))) core = i;
         mdrt_menu_add_choice(m, I_FM_CORE, "FM core", s->core_label, s->ncores, core);
         mdrt_menu_add_choice(m, I_FM_CHIP, "FM chip", chip_name, 2, s->cfg->fm_model);
+        mdrt_menu_add_choice(m, I_LOWPASS, "Low-pass", off_on, 2, s->cfg->lowpass_hz != 0);
         mdrt_menu_add(m, I_BACK, MDRT_ITEM_ACTION, "Back");
-        snprintf(m->subtitle, sizeof m->subtitle, "YM2612: early consoles. YM3438: later ones.");
+        snprintf(m->subtitle, sizeof m->subtitle, "YM2612: early consoles. YM3438: later ones. Low-pass: a Model 1's muffled sound.");
         break;
     }
     case PAGE_OPTIONS: {
@@ -2252,6 +2261,11 @@ static void act(sdl *s, int id)
         if (running) SDL_AtomicSet(&s->fm_want, 1 + core->value * 2 + chip->value);   /* (made between frames) */
         return;
     }
+    case I_LOWPASS:
+        s->cfg->lowpass_hz = it->value ? MDRT_MIX_LOWPASS_MODEL1 : 0;
+        mdrt_settings_set(s->set, "audio.lowpass", off_on[it->value]);
+        if (running) SDL_AtomicSet(&s->lowpass_want, 1 + it->value);   /* (set between frames) */
+        return;
         return;
     case I_FAST:
         SDL_AtomicSet(&s->fast_speed, fast_speeds[it->value]);
