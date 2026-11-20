@@ -2032,6 +2032,23 @@ static void restart(sdl *s, const char *rom_path)
     close_menu(s);
 }
 
+/* a file dropped on the window: a ROM the game can run is loaded and kept as the menu's choice
+ * would be, and the game starts again with it; one it cannot run says why on the menu */
+static void rom_dropped(sdl *s, const char *path)
+{
+    if (!s->o->rom_check) return;
+    const char *why = SDL_AtomicGet(&s->session) ? "Not during netplay" : try_rom(s, path, 0);
+    if (why) {
+        if (!s->menu_open) open_menu(s, PAGE_MAIN, I_ROM);
+        else build_page(s, s->page, I_ROM);
+        snprintf(s->menu.message, sizeof s->menu.message, "%s: %s", base_name(path), why);
+        s->redraw = 1;
+        return;
+    }
+    restart(s, path);
+    s->redraw = 1;
+}
+
 /* a controller button for a pad's button (SDL_CONTROLLER_BUTTON_INVALID: none) */
 static void bind_cbutton(sdl *s, int id, SDL_GameControllerButton b)
 {
@@ -3099,6 +3116,7 @@ int mdrt_sdl_run(mdrt_config *cfg, const mdrt_sdl_options *o, mdrt_game_fn game,
                 if (s->menu_open && s->menu.editing >= 0 && mdrt_menu_type(&s->menu, e.text.text)) s->redraw = 1;
             } else if (e.type == SDL_CONTROLLERBUTTONDOWN) pad_pressed(s, (SDL_GameControllerButton)e.cbutton.button);
             else if (e.type == SDL_WINDOWEVENT) window_event(s, &e.window);
+            else if (e.type == SDL_DROPFILE) { if (e.drop.file) rom_dropped(s, e.drop.file); SDL_free(e.drop.file); }
             else if (e.type == SDL_RENDER_TARGETS_RESET) s->redraw = 1;
             else if (e.type == s->frame_event) SDL_AtomicSet(&s->frame_posted, 0);   /* (drawn below) */
             else if (e.type == SDL_CONTROLLERDEVICEADDED || e.type == SDL_CONTROLLERDEVICEREMOVED) {

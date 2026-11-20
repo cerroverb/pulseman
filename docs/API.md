@@ -42,7 +42,9 @@ plays: `mdrt_set_fm`; and the low-pass, off by default: `mdrt_set_lowpass`), opt
 `rom_check` (are these bytes a ROM the game can run, or why not, in a few words) and `rom_use`
 (the ROM, before the game starts), and `rom_path` (the command line's) and `rom_default`: the
 platform reads the file, keeps the bytes, remembers the one the player chose in the settings and,
-when none will do, opens the menu on a file browser. The menu's reset and a new ROM stop the game
+when none will do, opens the menu on a file browser. A file dropped on the window is taken as
+the browser's choice would be (the game starts again with it; one that will not do says why on
+the menu). The menu's reset and a new ROM stop the game
 (`mdrt_wait_vblank` returns nonzero), make a new console and call the game function again: it
 must then start from scratch, as at power on, whatever it kept in its own statics (worth a
 test: a restart against a fresh power on, frame by frame).

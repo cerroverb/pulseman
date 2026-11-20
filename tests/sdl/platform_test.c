@@ -80,6 +80,15 @@ static void press_mod(SDL_Scancode k, Uint16 mod)        /* with Shift or Ctrl h
     key(k, 0);
 }
 
+static void drop(const char *path)                        /* a file dropped on the window */
+{
+    SDL_Event e;
+    SDL_zero(e);
+    e.type = SDL_DROPFILE;
+    e.drop.file = SDL_strdup(path);
+    SDL_PushEvent(&e);
+}
+
 static void focus(int gained)
 {
     SDL_Event e;
@@ -178,6 +187,16 @@ static int menu_player(void *user)
         SDL_Delay(300);
         CHECK_EQ(SDL_AtomicGet(&starts), 1);
         CHECK(!strcmp(rom_seen, "GOOD-other"));
+        drop("bad.gen");                                  /* a file dropped on the window that will not do: the game goes on */
+        SDL_Delay(400);
+        CHECK_EQ(SDL_AtomicGet(&starts), 1);
+        CHECK(!strcmp(rom_seen, "GOOD-other"));
+        press(SDL_SCANCODE_ESCAPE);                       /* (the menu it opened to say why) */
+        SDL_Delay(200);
+        drop("good.gen");                                 /* one that will: the game again with it */
+        SDL_Delay(600);
+        CHECK_EQ(SDL_AtomicGet(&starts), 2);
+        CHECK(!strcmp(rom_seen, "GOOD-good"));
         quit_event();
         return 0;
     }
