@@ -187,6 +187,10 @@ int mdrt_wait_line(mdrt *m, int line);
  * each line of the display) */
 typedef void (*mdrt_hint_fn)(void *user);
 void mdrt_set_hint(mdrt *m, mdrt_hint_fn fn, void *user);
+/* inside the H-interrupt handler, for a client that runs it without moving the clock: its VDP
+ * writes from here on are taken as `mclk` master clocks after the interrupt (the line's start),
+ * so a write past the horizontal blank goes to the next line as on the console */
+void mdrt_hint_clock(mdrt *m, uint32_t mclk);
 
 /* the handshake: draw the picture, make the frame's sound, hand both to the platform, wait for
  * its go, read the pads. On return the next frame has begun with the VDP in its vertical blank

@@ -408,6 +408,12 @@ static void hint_now(mdrt *m)
     m->in_hint = 1;
     m->hint(m->hint_user);
     m->in_hint = 0;
+    m->lines.now = m->now;
+}
+
+void mdrt_hint_clock(mdrt *m, uint32_t mclk)
+{
+    if (m->in_hint) m->lines.now = m->now + mclk;
 }
 
 /* on to `to`: the counter's reload on the last line of the vertical blank, then each display line
