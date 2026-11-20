@@ -67,8 +67,10 @@ static void window_span(const mdrt_vdp *v, int line, int width, int *x0, int *x1
 
 /* the sprites on a line, in link order from entry 0; the first opaque pixel wins. Y, size and
  * link come from the sprite cache, tile and X from VRAM. Per line at most 20 sprites and 320
- * pixels in H40 (16 and 256 in H32); a sprite at X 0 (raw) after another sprite on the line hides
- * the rest of the line's sprites. Sprite tiles go down the columns first. */
+ * pixels in H40 (16 and 256 in H32), the pixels counted in the pattern's order (a flipped sprite
+ * cut by the limit keeps its right side, as BlastEm and the console); a sprite at X 0 (raw) after
+ * another sprite on the line hides the rest of the line's sprites. Sprite tiles go down the
+ * columns first. */
 static void sprites(const mdrt_vdp *v, int line, int width, struct layer *out)
 {
     int h40 = width == 320;
@@ -89,11 +91,10 @@ static void sprites(const mdrt_vdp *v, int line, int width, struct layer *out)
             if (rawx == 0 && shown > 1) masked = 1;
             int row = line - y;
             if (e & 0x1000) row = sh * 8 - 1 - row;
-            for (int cx = 0; cx < sw * 8; cx++) {
+            for (int tx = 0; tx < sw * 8; tx++) {         /* (in pattern order: past the dot limit a flipped sprite loses its left side) */
                 if (dots-- <= 0) break;
-                int sx = x + cx;
+                int cx = (e & 0x0800) ? sw * 8 - 1 - tx : tx, sx = x + cx;
                 if (masked || sx < 0 || sx >= width || out->col[sx]) continue;
-                int tx = (e & 0x0800) ? sw * 8 - 1 - cx : cx;
                 uint16_t t = (uint16_t)((e & 0x7FF) + (tx >> 3) * sh + (row >> 3));
                 int p = tile_pixel(v, (uint16_t)(t & 0x7FF), tx & 7, row & 7);
                 if (!p) continue;
