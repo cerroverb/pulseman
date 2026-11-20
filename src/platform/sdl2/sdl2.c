@@ -3027,6 +3027,9 @@ int mdrt_sdl_run(mdrt_config *cfg, const mdrt_sdl_options *o, mdrt_game_fn game,
     if (!s) return 1;
     s->o = o; s->cfg = cfg; s->game = game; s->user = user;
     s->binding = -1;
+    /* KMSDRM and Raspberry Pi flip from a third buffer unless told otherwise, a frame later; the
+       environment's SDL_VIDEO_DOUBLE_BUFFER still overrides this */
+    SDL_SetHint(SDL_HINT_VIDEO_DOUBLE_BUFFER, "1");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) { fprintf(stderr, "SDL: %s\n", SDL_GetError()); return 1; }
     settings_load(s);
     for (s->ncores = 0; s->ncores < 8 && mdrt_fm_cores(s->ncores); s->ncores++) s->core_label[s->ncores] = core_label(mdrt_fm_cores(s->ncores));
