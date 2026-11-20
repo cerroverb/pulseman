@@ -14,7 +14,7 @@
  * save slots (the menu's Save and Load pages, a save out of play that changes nothing) and the
  * Autosave (the state at quitting, not loaded at the next start but from the Load page's first
  * line; the last one kept when quitting out of play); and
- * captures: the replay saved by F10, a recording by F11, the replay from the menu, each GIF read
+ * captures: the replay saved by F10, a recording by Alt+Enter, the replay from the menu, each GIF read
  * back, and a control's key set with Ctrl by pressing it; and an older build's keys taken out of
  * the settings; and the client's own options page (a preset changing another value, the values
  * given at each power on, kept in the file, and the save RAM in the file the values name). */
@@ -421,18 +421,23 @@ static int slots(void *user)
     return 0;
 }
 
-/* run 8: captures: the replay (F10), a recording of a second (F11 twice), the replay from the menu;
- * then Record's key set to Ctrl+F11 by pressing it */
+/* run 8: captures: the replay (F10), a recording of a second (Alt+Enter twice), F11 full screen
+ * on and off, the replay from the menu; then Record's key set to Ctrl+F11 by
+ * pressing it */
 static int capturer(void *user)
 {
     (void)user;
     until_frame(150);
     press(SDL_SCANCODE_F10);
     SDL_Delay(1000);
-    press(SDL_SCANCODE_F11);
+    press_mod(SDL_SCANCODE_RETURN, KMOD_LALT);
     SDL_Delay(1000);
-    press(SDL_SCANCODE_F11);
+    press_mod(SDL_SCANCODE_RETURN, KMOD_LALT);
     SDL_Delay(1000);
+    press(SDL_SCANCODE_F11);                              /* full screen and back: the game goes on */
+    SDL_Delay(300);
+    press(SDL_SCANCODE_F11);
+    SDL_Delay(300);
     /* the menu: [Resume, Reset, Save, Load, Video, Capture ...]; Capture: [Save replay, Start
      * recording, Replay length, GIF size, Back] */
     keys(SDL_SCANCODE_ESCAPE, 1);
@@ -799,7 +804,7 @@ static void check_settings(void)
     static const char *const want[] = {
         "# the test's own comment\n", "mystery.key = kept\n", "general.screenshots = shots\n", "general.fast_forward = 4\n",
         "audio.volume = 80\n", "audio.mute = 1\n", "video.scale = integer\n", "video.aspect = square\n",
-        "pad1.start = Return\n", "pad2.a = Q\n", "key.screenshot = F12\n", "key.slow_motion = F7\n", "key.pause = F5\n", "key.save_replay = F10\n", "key.record = F11\n", "key.mute = F1\n",
+        "pad1.start = Return\n", "pad2.a = Q\n", "key.screenshot = F12\n", "key.slow_motion = F7\n", "key.pause = F5\n", "key.save_replay = F10\n", "key.record = Alt+Return\n", "key.mute = F1\n",
         "key.menu = Escape\n", "game.rom =\n", "audio.lowpass = off\n",
     };
     for (size_t i = 0; i < sizeof want / sizeof *want; i++)
@@ -835,7 +840,7 @@ int main(int argc, char **argv)
     if (d) closedir(d);
     char text[1024];
     snprintf(text, sizeof text, "# the test's own comment\nmystery.key = kept\ngeneral.screenshots = %s\nvideo.scale = integer\n"
-             "key.save_state = F9\nkey.fullscreen = F11\ncapture.format = mp4\n", shots);   /* (the last three: an older build's) */
+             "key.save_state = F9\nkey.fullscreen = F11\ncapture.format = mp4\nkey.record = F11\n", shots);   /* (the last four: an older build's; Record's F11 becomes Alt+Return) */
     spit(settings_path, text);
     run = 1;
     CHECK_EQ(play(), 0);

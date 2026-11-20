@@ -34,16 +34,16 @@
 /* ---- the keys: what each does, its setting and its default ------------------------------------ */
 
 /* the controls on the function keys, in the keyboard's groups of four: the sound and rewind;
- * time (pause, fast-forward, slow motion, a frame); captures (F9 free: the replay, recording, a
- * screenshot). States and full screen are the menu's (and Alt+Enter). A control's key may have
- * Shift, Ctrl or Alt. */
+ * time (pause, fast-forward, slow motion, a frame); captures (F9 free: the replay, a screenshot;
+ * recording on Alt+Enter). States are the menu's; full screen the menu's and F11. A control's key
+ * may have Shift, Ctrl or Alt. */
 enum { K_MUTE, K_VOL_DOWN, K_VOL_UP, K_REWIND, K_PAUSE, K_FAST, K_SLOW, K_STEP, K_REPLAY, K_RECORD, K_SHOT, K_MENU, K_COUNT };
 static const char *const key_setting[K_COUNT][3] = {
     { "key.mute", "F1", "Mute" }, { "key.volume_down", "F2", "Volume down" }, { "key.volume_up", "F3", "Volume up" },
     { "key.rewind", "F4", "Rewind (held)" }, { "key.pause", "F5", "Pause" },
     { "key.fast_forward", "F6", "Fast-forward (held)" }, { "key.slow_motion", "F7", "Slow motion" },
     { "key.frame_step", "F8", "A frame, while paused" }, { "key.save_replay", "F10", "Save the replay" },
-    { "key.record", "F11", "Record (again: stop)" }, { "key.screenshot", "F12", "Screenshot" },
+    { "key.record", "Alt+Return", "Record (again: stop)" }, { "key.screenshot", "F12", "Screenshot" },
     { "key.menu", "Escape", "Menu" },
 };
 enum { BUTTONS = 12 };
@@ -1075,6 +1075,10 @@ static void settings_load(sdl *s)
     s->dead_zone = clamp(mdrt_settings_get_int(s->set, "controller.dead_zone", 50), 5, 95);
     s->turbo_rate = clamp(mdrt_settings_get_int(s->set, "general.turbo_rate", 10), 1, 30);
     for (int i = 0; i < K_COUNT; i++) {
+        if (i == K_RECORD) {                              /* (F11 was Record's default: full screen's now) */
+            const char *was = mdrt_settings_get(s->set, key_setting[i][0]);
+            if (was && !strcmp(was, "F11")) mdrt_settings_set(s->set, key_setting[i][0], key_setting[i][1]);
+        }
         mdrt_settings_default(s->set, key_setting[i][0], key_setting[i][1]);
         s->key[i] = bound_mod(mdrt_settings_get(s->set, key_setting[i][0]), &s->key_mod[i]);
     }
@@ -2452,7 +2456,10 @@ static void menu_input(sdl *s, int in)
 
 static void key_pressed(sdl *s, SDL_Scancode k, SDL_Keymod mod, int repeat)
 {
-    if (k == SDL_SCANCODE_RETURN && (mod & KMOD_ALT)) { if (!repeat) set_fullscreen(s, !is_fullscreen(s)); return; }
+    if (k == SDL_SCANCODE_F11 && !(mod & (KMOD_SHIFT | KMOD_CTRL | KMOD_ALT)) && !(s->menu_open && s->binding >= 0)) {
+        if (!repeat) set_fullscreen(s, !is_fullscreen(s));
+        return;
+    }
     if (s->menu_open) {
         if (s->binding >= 0) { if (!repeat) bind_key(s, k, mod); s->redraw = 1; return; }
         if (s->menu.editing >= 0) {                       /* (a field: its text comes as SDL_TEXTINPUT) */
@@ -3110,7 +3117,10 @@ int mdrt_sdl_run(mdrt_config *cfg, const mdrt_sdl_options *o, mdrt_game_fn game,
             if (e.type == SDL_QUIT) request_quit(s);
             else if (e.type == SDL_KEYDOWN || e.type == SDL_KEYUP) {
                 SDL_Scancode k = e.key.keysym.scancode;
-                if (k > SDL_SCANCODE_UNKNOWN && k < SDL_NUM_SCANCODES && !s->menu_open) s->down[k] = e.type == SDL_KEYDOWN;
+                int held = e.key.keysym.mod & (KMOD_SHIFT | KMOD_CTRL | KMOD_ALT), control = 0;
+                for (int i = 0; i < K_COUNT && e.type == SDL_KEYDOWN && held; i++)   /* (a control with Shift, Ctrl or Alt: not the game's key too) */
+                    if (s->key[i] == k && s->key_mod[i] && (held & s->key_mod[i])) control = 1;
+                if (k > SDL_SCANCODE_UNKNOWN && k < SDL_NUM_SCANCODES && !s->menu_open && !control) s->down[k] = e.type == SDL_KEYDOWN;
                 if (e.type == SDL_KEYDOWN) key_pressed(s, k, (SDL_Keymod)e.key.keysym.mod, e.key.repeat);
             } else if (e.type == SDL_TEXTINPUT) {
                 if (s->menu_open && s->menu.editing >= 0 && mdrt_menu_type(&s->menu, e.text.text)) s->redraw = 1;
