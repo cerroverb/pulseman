@@ -92,6 +92,24 @@ sdl-check: $(B)/tests/sdl/platform_test $(B)/tests/sdl/online_test
 	ASAN_OPTIONS=detect_leaks=0 $(B)/tests/sdl/platform_test $(B)/sdltest
 	ASAN_OPTIONS=detect_leaks=0 $(B)/tests/sdl/online_test $(B)/sdlnet
 
+# the SDL3 platform (src/platform/sdl3, the same API as SDL2's, mdrt/platform_sdl2.h): make sdl3,
+# and its tests (tests/sdl3: the SDL2 platform's, on SDL3): make sdl3-check
+SDL3CFLAGS := $(shell pkg-config --cflags sdl3 2>/dev/null)
+SDL3LIBS   := $(shell pkg-config --libs sdl3 2>/dev/null)
+$(B)/src/platform/sdl3/%.o: src/platform/sdl3/%.c $(wildcard include/mdrt/*.h)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(SDL3CFLAGS) -c $< -o $@
+$(B)/libmdrt_sdl3.a: $(B)/src/platform/sdl3/sdl3.o
+	$(AR) rcs $@ $^
+sdl3: $(B)/libmdrt_sdl3.a
+$(B)/tests/sdl3/%: tests/sdl3/%.c tests/check.c $(B)/libmdrt_sdl3.a $(B)/libmdrt.a
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(SDL3CFLAGS) -Itests -o $@ $< tests/check.c $(B)/libmdrt_sdl3.a $(B)/libmdrt.a $(LDFLAGS) $(LDLIBS) $(SDL3LIBS) -lm
+sdl3-check: $(B)/tests/sdl3/platform_test $(B)/tests/sdl3/online_test
+	@mkdir -p $(B)/sdl3test $(B)/sdl3net
+	ASAN_OPTIONS=detect_leaks=0 $(B)/tests/sdl3/platform_test $(B)/sdl3test
+	ASAN_OPTIONS=detect_leaks=0 $(B)/tests/sdl3/online_test $(B)/sdl3net
+
 # (record_test records the runtime's own traces into build/record; they are replayed as vectors)
 check: all
 	@fail=0; for t in $(TESTS); do echo "== $$t"; $$t || fail=1; done; \
@@ -102,4 +120,4 @@ check: all
 clean:
 	rm -rf build
 
-.PHONY: all check clean sdl sdl-check
+.PHONY: all check clean sdl sdl-check sdl3 sdl3-check

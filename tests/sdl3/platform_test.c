@@ -1,0 +1,985 @@
+/* The SDL2 platform played as a player would (make sdl-check): a thread presses keys (SDL events)
+ * while a small game runs under SDL's dummy video and real-time disk sound. It checks the frame
+ * rate at full speed, with fast-forward held and in slow motion; pause and a frame step; the
+ * window losing focus (the game going on, the keys let go); a screenshot (its size and colour); the
+ * volume and mute in the sound written to disk; the settings kept in the file in the directory it
+ * runs in, with its comment and an unknown key; run again, keys bound in that file by hand; and
+ * the menu: a ROM chosen in its browser (one the client turns down first), the upscaler (MMPX 4x
+ * from then on, and on the next start) and the looks (the console's colours, dithering blended,
+ * scanlines and a shadow mask, from then on too), the scaling, the FM chip and the low-pass
+ * changed, a reset, another ROM while playing, a key changed by pressing it, and the ROM chosen
+ * last found again on the next start; and four players: EA's 4 Way Play in the ports, two virtual
+ * controllers given to players 1 and 3, a button moved, a turbo button, the stick's dead zone, a
+ * controller pulled out, the Players page and a controller button changed by pressing it; and the
+ * save slots (the menu's Save and Load pages, a save out of play that changes nothing) and the
+ * Autosave (the state at quitting, not loaded at the next start but from the Load page's first
+ * line; the last one kept when quitting out of play); and
+ * captures: the replay saved by F10, a recording by Alt+Enter, the replay from the menu, each GIF read
+ * back, and a control's key set with Ctrl by pressing it; and an older build's keys taken out of
+ * the settings; and the client's own options page (a preset changing another value, the values
+ * given at each power on, kept in the file, and the save RAM in the file the values name). */
+#include <SDL3/SDL.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#define chdir _chdir
+#define make_dir(d) _mkdir(d)
+#define remove_dir(d) _rmdir(d)
+#else
+#include <unistd.h>
+#define make_dir(d) mkdir(d, 0777)
+#define remove_dir(d) rmdir(d)
+#endif
+#include <stdlib.h>
+#include <string.h>
+#include "check.h"
+#include "mdrt/mix.h"
+#include "mdrt/platform_sdl2.h"
+#include "mdrt/gif.h"
+#include "mdrt/png.h"
+
+#define BACKDROP 0x0E42                                   /* the picture: the backdrop's colour */
+
+static const char *const shots = "shots", *const sound = "sound.raw", *const settings_path = "settings.ini";
+static SDL_AtomicInt frame, held, starts, fm_second, lowpass_on, pads4[MDRT_PADS], adaptor, game_frame, refuse_saves, opt_seen[5], opt_uses, opt_read, text_asked[2], text_share, picks;
+static int run;
+static char rom_seen[16];                                 /* the start of the ROM the client was given */
+
+static void quit_event(void)
+{
+    SDL_Event e;
+    SDL_zero(e);
+    e.type = SDL_EVENT_QUIT;
+    SDL_PushEvent(&e);
+}
+
+static void key(SDL_Scancode k, int down)
+{
+    SDL_Event e;
+    SDL_zero(e);
+    e.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+    e.key.down = down != 0;
+    e.key.scancode = k;
+    e.key.key = SDL_GetKeyFromScancode(k, SDL_KMOD_NONE, false);
+    SDL_PushEvent(&e);
+}
+
+static void press(SDL_Scancode k) { key(k, 1); key(k, 0); }
+
+static void press_mod(SDL_Scancode k, Uint16 mod)        /* with Shift or Ctrl held */
+{
+    SDL_Event e;
+    SDL_zero(e);
+    e.type = SDL_EVENT_KEY_DOWN;
+    e.key.down = true;
+    e.key.scancode = k;
+    e.key.key = SDL_GetKeyFromScancode(k, SDL_KMOD_NONE, false);
+    e.key.mod = mod;
+    SDL_PushEvent(&e);
+    key(k, 0);
+}
+
+static void drop(const char *path)                        /* a file dropped on the window */
+{
+    SDL_Event e;
+    SDL_zero(e);
+    e.type = SDL_EVENT_DROP_FILE;
+    e.drop.data = path;                                   /* (SDL3: the path itself, kept by the caller: literals here) */
+    SDL_PushEvent(&e);
+}
+
+static void focus(int gained)
+{
+    SDL_Event e;
+    SDL_zero(e);
+    e.type = gained ? SDL_EVENT_WINDOW_FOCUS_GAINED : SDL_EVENT_WINDOW_FOCUS_LOST;
+    SDL_PushEvent(&e);
+}
+
+/* frames a second over ms */
+static double rate(int ms)
+{
+    int f0 = SDL_GetAtomicInt(&frame);
+    Uint64 t0 = SDL_GetPerformanceCounter();
+    SDL_Delay((Uint32)ms);
+    int f1 = SDL_GetAtomicInt(&frame);
+    return (f1 - f0) * (double)SDL_GetPerformanceFrequency() / (double)(SDL_GetPerformanceCounter() - t0);
+}
+
+static void until_frame(int n) { while (SDL_GetAtomicInt(&frame) < n) SDL_Delay(5); }
+
+static int player(void *user)
+{
+    (void)user;
+    until_frame(30);
+    if (run == 2) {                                       /* the keys rebound by hand */
+        key(SDL_SCANCODE_S, 1); SDL_Delay(200);
+        CHECK_EQ(SDL_GetAtomicInt(&held) & (MDRT_PAD_START | MDRT_PAD_A), MDRT_PAD_START);
+        key(SDL_SCANCODE_S, 0); key(SDL_SCANCODE_RETURN, 1); key(SDL_SCANCODE_Z, 1); SDL_Delay(200);
+        CHECK_EQ(SDL_GetAtomicInt(&held) & (MDRT_PAD_START | MDRT_PAD_A), 0);
+        key(SDL_SCANCODE_RETURN, 0); key(SDL_SCANCODE_Z, 0); key(SDL_SCANCODE_K, 1); SDL_Delay(200);
+        CHECK_EQ(SDL_GetAtomicInt(&held) & 0xFFF, MDRT_PAD_B);
+        key(SDL_SCANCODE_K, 0);
+        quit_event();
+        return 0;
+    }
+    double normal = rate(1000);
+    key(SDL_SCANCODE_F6, 1);
+    double fast = rate(500);
+    key(SDL_SCANCODE_F6, 0);
+    press(SDL_SCANCODE_F7);
+    double slow = rate(1000);
+    press(SDL_SCANCODE_F7);
+    printf("  frames a second: %.1f, fast-forward %.1f, slow motion %.1f\n", normal, fast, slow);
+    CHECK(normal > 50 && normal < 70);
+#ifndef __SANITIZE_ADDRESS__                             /* (the sanitizers' build runs no faster than about 65) */
+    CHECK(fast > normal * 3);                             /* (4 times, in the settings) */
+#endif
+    CHECK(slow > normal * 0.4 && slow < normal * 0.6);
+    press(SDL_SCANCODE_F12);
+    press(SDL_SCANCODE_F2);
+    press(SDL_SCANCODE_F2);
+    SDL_Delay(1000);
+    /* pause, two frames stepped, on again */
+    press(SDL_SCANCODE_F5);
+    SDL_Delay(300);
+    int c0 = SDL_GetAtomicInt(&frame);
+    SDL_Delay(300);
+    CHECK_EQ(SDL_GetAtomicInt(&frame), c0);
+    press(SDL_SCANCODE_F8);
+    SDL_Delay(200);
+    CHECK_EQ(SDL_GetAtomicInt(&frame), c0 + 1);
+    press(SDL_SCANCODE_F8);
+    SDL_Delay(200);
+    CHECK_EQ(SDL_GetAtomicInt(&frame), c0 + 2);
+    press(SDL_SCANCODE_F5);
+    CHECK(rate(300) > 40);
+    /* the window loses focus with fast-forward held: the game goes on, at its speed (the key let go) */
+    key(SDL_SCANCODE_F6, 1);
+    SDL_Delay(200);
+    focus(0);
+    SDL_Delay(200);
+    double away = rate(600);
+    printf("  with the focus elsewhere: %.1f frames a second\n", away);
+    CHECK(away > normal * 0.8 && away < normal * 1.3);
+    focus(1);
+    double back = rate(600);
+    printf("  after focus came back: %.1f frames a second\n", back);
+    CHECK(back > normal * 0.8 && back < normal * 1.3);
+    key(SDL_SCANCODE_F6, 0);
+    press(SDL_SCANCODE_F1);
+    SDL_Delay(800);
+    quit_event();
+    return 0;
+}
+
+/* the menu, as a player works it: run 3 starts with no ROM it can find */
+static void keys(SDL_Scancode k, int n) { for (int i = 0; i < n; i++) { press(k); SDL_Delay(40); } }
+
+static int menu_player(void *user)
+{
+    (void)user;
+    while (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_Delay(10);
+    SDL_Delay(500);
+    if (run == 4) {                                       /* the ROM chosen last: playing at once */
+        SDL_Delay(300);
+        CHECK_EQ(SDL_GetAtomicInt(&starts), 1);
+        CHECK(!strcmp(rom_seen, "GOOD-other"));
+        drop("bad.gen");                                  /* a file dropped on the window that will not do: the game goes on */
+        SDL_Delay(400);
+        CHECK_EQ(SDL_GetAtomicInt(&starts), 1);
+        CHECK(!strcmp(rom_seen, "GOOD-other"));
+        press(SDL_SCANCODE_ESCAPE);                       /* (the menu it opened to say why) */
+        SDL_Delay(200);
+        drop("good.gen");                                 /* one that will: the game again with it */
+        SDL_Delay(600);
+        CHECK_EQ(SDL_GetAtomicInt(&starts), 2);
+        CHECK(!strcmp(rom_seen, "GOOD-good"));
+        quit_event();
+        return 0;
+    }
+    CHECK_EQ(SDL_GetAtomicInt(&starts), 0);                  /* the ROM page: [.., roms/, shots/, bad.gen, good.gen] */
+    keys(SDL_SCANCODE_RETURN, 1);                         /* bad.gen, selected first: turned down */
+    SDL_Delay(300);
+    CHECK_EQ(SDL_GetAtomicInt(&starts), 0);
+    keys(SDL_SCANCODE_DOWN, 1);
+    keys(SDL_SCANCODE_RETURN, 1);                         /* good.gen: the game starts */
+    SDL_Delay(500);
+    CHECK_EQ(SDL_GetAtomicInt(&starts), 1);
+    CHECK(!strcmp(rom_seen, "GOOD-good"));
+    CHECK(SDL_GetAtomicInt(&frame) > 10);
+    /* the menu: [Resume, Game ROM, Reset, Save, Load, Video, Capture, Sound, Players, Options, Keys, Quit] */
+    keys(SDL_SCANCODE_ESCAPE, 1);
+    SDL_Delay(200);
+    int f0 = SDL_GetAtomicInt(&frame);
+    SDL_Delay(300);
+    CHECK_EQ(SDL_GetAtomicInt(&frame), f0);                  /* the game waits */
+    keys(SDL_SCANCODE_DOWN, 5);
+    keys(SDL_SCANCODE_RETURN, 1);                         /* Video: [Upscaler, Scaling, Aspect, Colours, Blend, Scanlines, Mask, Full screen, Vsync, Back] */
+    keys(SDL_SCANCODE_RIGHT, 4);                          /* off -> scale2x -> scale3x -> mmpx2x -> mmpx4x (from here on) */
+    keys(SDL_SCANCODE_DOWN, 1);
+    keys(SDL_SCANCODE_RIGHT, 1);                          /* integer (run 1's file) -> fit */
+    keys(SDL_SCANCODE_DOWN, 2);
+    keys(SDL_SCANCODE_RIGHT, 2);                          /* the colours: standard -> full range -> the console's */
+    keys(SDL_SCANCODE_DOWN, 1);
+    keys(SDL_SCANCODE_RIGHT, 1);                          /* blend dithering (and from here on, with: */
+    keys(SDL_SCANCODE_DOWN, 1);
+    keys(SDL_SCANCODE_RIGHT, 2);                          /* medium scanlines */
+    keys(SDL_SCANCODE_DOWN, 1);
+    keys(SDL_SCANCODE_LEFT, 1);                           /* and a shadow mask: off, round to the last) */
+    keys(SDL_SCANCODE_DOWN, 2);
+    keys(SDL_SCANCODE_RIGHT, 1);                          /* vsync: off (the default) -> on */
+    keys(SDL_SCANCODE_DOWN, 1);
+    keys(SDL_SCANCODE_RIGHT, 1);                          /* frame pacing: sound -> display (the dummy screen has no rate: the sound's) */
+    keys(SDL_SCANCODE_DOWN, 1);
+    keys(SDL_SCANCODE_RIGHT, 2);                          /* late input: 4 ms */
+    keys(SDL_SCANCODE_ESCAPE, 1);
+    keys(SDL_SCANCODE_DOWN, 2);
+    keys(SDL_SCANCODE_RETURN, 1);                         /* Sound: [Volume, Mute, FM core, FM chip, Low-pass, Back] */
+    CHECK_EQ(SDL_GetAtomicInt(&lowpass_on), 0);              /* (off by default) */
+    keys(SDL_SCANCODE_DOWN, 2);
+    keys(SDL_SCANCODE_RIGHT, 1);                          /* the next FM core */
+    keys(SDL_SCANCODE_DOWN, 2);
+    keys(SDL_SCANCODE_RIGHT, 1);                          /* the low-pass on */
+    keys(SDL_SCANCODE_ESCAPE, 2);                         /* back, and out */
+    SDL_Delay(300);
+    CHECK(SDL_GetAtomicInt(&frame) > f0 + 5);
+    CHECK_EQ(SDL_GetAtomicInt(&fm_second), mdrt_fm_cores(1) != NULL);   /* (changed between frames) */
+    CHECK_EQ(SDL_GetAtomicInt(&lowpass_on), MDRT_MIX_LOWPASS_MODEL1);   /* (set between frames, while playing) */
+    keys(SDL_SCANCODE_ESCAPE, 1);
+    keys(SDL_SCANCODE_DOWN, 2);
+    keys(SDL_SCANCODE_RETURN, 1);                         /* Reset: chosen once, asked again */
+    SDL_Delay(200);
+    CHECK_EQ(SDL_GetAtomicInt(&starts), 1);
+    keys(SDL_SCANCODE_RETURN, 1);
+    SDL_Delay(400);
+    CHECK_EQ(SDL_GetAtomicInt(&starts), 2);
+    f0 = SDL_GetAtomicInt(&frame);
+    SDL_Delay(200);
+    CHECK(SDL_GetAtomicInt(&frame) > f0);                    /* playing again, the menu closed */
+    keys(SDL_SCANCODE_ESCAPE, 1);
+    keys(SDL_SCANCODE_DOWN, 1);
+    keys(SDL_SCANCODE_RETURN, 1);                         /* Game ROM: good.gen selected */
+    keys(SDL_SCANCODE_UP, 3);
+    keys(SDL_SCANCODE_RETURN, 1);                         /* roms/: [.., other.gen] */
+    keys(SDL_SCANCODE_RETURN, 2);                         /* other.gen, chosen again: the game starts with it */
+    SDL_Delay(400);
+    CHECK_EQ(SDL_GetAtomicInt(&starts), 3);
+    CHECK(!strcmp(rom_seen, "GOOD-other"));
+    keys(SDL_SCANCODE_ESCAPE, 1);
+    keys(SDL_SCANCODE_DOWN, 10);
+    keys(SDL_SCANCODE_RETURN, 1);                         /* Keys: pad 1's up, down ... */
+    keys(SDL_SCANCODE_DOWN, 7);
+    keys(SDL_SCANCODE_RETURN, 1);                         /* Pad 1 Start: press the new key */
+    keys(SDL_SCANCODE_HOME, 1);
+    keys(SDL_SCANCODE_ESCAPE, 2);
+    SDL_Delay(200);
+    key(SDL_SCANCODE_HOME, 1);
+    SDL_Delay(200);
+    CHECK_EQ(SDL_GetAtomicInt(&held) & MDRT_PAD_START, MDRT_PAD_START);
+    key(SDL_SCANCODE_HOME, 0);
+    quit_event();
+    return 0;
+}
+
+/* run 5: two virtual controllers (SDL's standard layout), plugged in while the game runs */
+static void vbutton(SDL_Joystick *j, SDL_GamepadButton b, int on) { SDL_SetJoystickVirtualButton(j, b, on != 0); SDL_Delay(120); }
+static SDL_JoystickID virtual_pad(void)                   /* (SDL's standard layout: a gamepad's axes and buttons) */
+{
+    SDL_VirtualJoystickDesc d;
+    SDL_INIT_INTERFACE(&d);
+    d.type = SDL_JOYSTICK_TYPE_GAMEPAD;
+    d.naxes = SDL_GAMEPAD_AXIS_COUNT;
+    d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
+    return SDL_AttachVirtualJoystick(&d);
+}
+
+static int players(void *user)
+{
+    (void)user;
+    until_frame(20);
+    SDL_JoystickID i1 = virtual_pad();
+    SDL_Joystick *c1 = SDL_OpenJoystick(i1);
+    SDL_JoystickID i2 = virtual_pad();
+    SDL_Joystick *c2 = SDL_OpenJoystick(i2);
+    SDL_Delay(300);
+    CHECK_EQ(SDL_GetAtomicInt(&adaptor), MDRT_ADAPTOR_EA4WAY);
+    vbutton(c1, SDL_GAMEPAD_BUTTON_NORTH, 1);              /* controller 1 is player 3's; C is on Y */
+    CHECK_EQ(SDL_GetAtomicInt(&pads4[2]) & 0xFF, MDRT_PAD_C);   /* (Y too: still the pad's Y, which a 3-button pad lacks) */
+    CHECK_EQ(SDL_GetAtomicInt(&pads4[0]), 0);
+    vbutton(c1, SDL_GAMEPAD_BUTTON_NORTH, 0);
+    vbutton(c2, SDL_GAMEPAD_BUTTON_DPAD_UP, 1);        /* controller 2 is player 1's */
+    CHECK_EQ(SDL_GetAtomicInt(&pads4[0]), MDRT_PAD_UP);
+    vbutton(c2, SDL_GAMEPAD_BUTTON_DPAD_UP, 0);
+    SDL_SetJoystickVirtualAxis(c2, SDL_GAMEPAD_AXIS_LEFTX, 20000);   /* 61%: past the dead zone (50%) */
+    SDL_Delay(120);
+    CHECK_EQ(SDL_GetAtomicInt(&pads4[0]), MDRT_PAD_RIGHT);
+    SDL_SetJoystickVirtualAxis(c2, SDL_GAMEPAD_AXIS_LEFTX, 12000);   /* 37%: inside it */
+    SDL_Delay(120);
+    CHECK_EQ(SDL_GetAtomicInt(&pads4[0]), 0);
+    SDL_SetJoystickVirtualAxis(c2, SDL_GAMEPAD_AXIS_LEFTX, 0);
+    SDL_SetJoystickVirtualButton(c1, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, true);   /* turbo B: on and off, ten a second */
+    int changes = 0, last = 0;
+    for (int f = SDL_GetAtomicInt(&frame), k = 0; k < 60; k++) {
+        while (SDL_GetAtomicInt(&frame) == f) SDL_Delay(1);
+        f = SDL_GetAtomicInt(&frame);
+        int b = (SDL_GetAtomicInt(&pads4[2]) & MDRT_PAD_B) != 0;
+        changes += b != last;
+        last = b;
+    }
+    SDL_SetJoystickVirtualButton(c1, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, false);
+    printf("  turbo: %d changes of B in 60 frames\n", changes);
+    CHECK(changes >= 12 && changes <= 30);
+    SDL_CloseJoystick(c2);                                /* controller 2 pulled out: controller 1 keeps its slot */
+    SDL_DetachVirtualJoystick(i2);
+    SDL_Delay(200);
+    vbutton(c1, SDL_GAMEPAD_BUTTON_NORTH, 1);
+    CHECK_EQ(SDL_GetAtomicInt(&pads4[2]) & 0xFF, MDRT_PAD_C);   /* (Y too: still the pad's Y, which a 3-button pad lacks) */
+    vbutton(c1, SDL_GAMEPAD_BUTTON_NORTH, 0);
+    /* the menu: [Resume, Reset, Save, Load, Video, Capture, Sound, Players, Options, Keys, Quit] */
+    keys(SDL_SCANCODE_ESCAPE, 1);
+    keys(SDL_SCANCODE_DOWN, 7);
+    keys(SDL_SCANCODE_RETURN, 1);                         /* Players: [Controllers, Player 1-4, Controller buttons ...] */
+    keys(SDL_SCANCODE_DOWN, 1);
+    keys(SDL_SCANCODE_RIGHT, 1);                          /* player 1: controller 2 -> 3 */
+    keys(SDL_SCANCODE_DOWN, 4);
+    keys(SDL_SCANCODE_RETURN, 1);                         /* Controller buttons: [A, B, C ...] */
+    keys(SDL_SCANCODE_RETURN, 1);                         /* A: press the button */
+    vbutton(c1, SDL_GAMEPAD_BUTTON_LEFT_STICK, 1);
+    vbutton(c1, SDL_GAMEPAD_BUTTON_LEFT_STICK, 0);
+    keys(SDL_SCANCODE_ESCAPE, 3);
+    SDL_Delay(200);
+    SDL_CloseJoystick(c1);
+    SDL_DetachVirtualJoystick(i1);
+    quit_event();
+    return 0;
+}
+
+/* runs 6 and 7: the save slots and the Autosave */
+static int state_in(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    int n = -1;
+    if (f && fscanf(f, "STATE %d", &n) != 1) n = -1;
+    if (f) fclose(f);
+    return n;
+}
+
+static int exists(const char *path) { FILE *f = fopen(path, "rb"); if (f) fclose(f); return f != NULL; }
+
+static int slots(void *user)
+{
+    (void)user;
+    until_frame(20);
+    if (run == 7) {                                       /* started again: from power on, the Autosave on the Load page */
+        int was = state_in("states/autosave.state");
+        int start = SDL_GetAtomicInt(&game_frame);
+        keys(SDL_SCANCODE_ESCAPE, 1);
+        keys(SDL_SCANCODE_DOWN, 3);
+        keys(SDL_SCANCODE_RETURN, 1);                     /* Load: [Autosave, slot 1-8, Back], slot 1 (chosen last) selected */
+        keys(SDL_SCANCODE_UP, 1);
+        keys(SDL_SCANCODE_RETURN, 1);                     /* the Autosave */
+        SDL_Delay(200);
+        printf("  the Autosave: run 6 quit at %d; started at %d, loaded: %d\n", was, start, SDL_GetAtomicInt(&game_frame));
+        CHECK(was > 0 && start < was);
+        CHECK(SDL_GetAtomicInt(&game_frame) >= was && SDL_GetAtomicInt(&game_frame) < was + 20);
+        SDL_SetAtomicInt(&refuse_saves, 1);                  /* quitting out of play: the last Autosave kept */
+        quit_event();
+        return 0;
+    }
+    /* the menu: [Resume, Reset, Save state, Load state, Video ...]; Save: [slot 1-8, Back], the
+     * slot chosen last selected */
+    keys(SDL_SCANCODE_ESCAPE, 1);
+    keys(SDL_SCANCODE_DOWN, 2);
+    keys(SDL_SCANCODE_RETURN, 2);                         /* slot 1 */
+    SDL_Delay(500);
+    int s1 = state_in("states/slot1.state");
+    CHECK(s1 > 0 && exists("states/slot1.png") && !exists("states/slot1.state.new"));
+    keys(SDL_SCANCODE_ESCAPE, 1);
+    keys(SDL_SCANCODE_DOWN, 2);
+    keys(SDL_SCANCODE_RETURN, 1);
+    keys(SDL_SCANCODE_DOWN, 1);
+    keys(SDL_SCANCODE_RETURN, 1);                         /* slot 2 */
+    SDL_Delay(500);
+    int s2 = state_in("states/slot2.state");
+    CHECK(s2 > s1 && exists("states/slot2.png"));
+    SDL_Delay(300);
+    keys(SDL_SCANCODE_ESCAPE, 1);
+    keys(SDL_SCANCODE_DOWN, 3);
+    keys(SDL_SCANCODE_RETURN, 2);                         /* Load: slot 2, the one chosen last */
+    SDL_Delay(200);
+    CHECK(SDL_GetAtomicInt(&game_frame) >= s2 && SDL_GetAtomicInt(&game_frame) < s2 + 20);
+    keys(SDL_SCANCODE_ESCAPE, 1);
+    keys(SDL_SCANCODE_DOWN, 3);
+    keys(SDL_SCANCODE_RETURN, 1);
+    keys(SDL_SCANCODE_UP, 1);
+    keys(SDL_SCANCODE_RETURN, 1);                         /* slot 1 */
+    SDL_Delay(200);
+    CHECK(SDL_GetAtomicInt(&game_frame) >= s1 && SDL_GetAtomicInt(&game_frame) < s1 + 20);
+    SDL_SetAtomicInt(&refuse_saves, 1);                      /* out of play: slot 1 as it was */
+    keys(SDL_SCANCODE_ESCAPE, 1);
+    keys(SDL_SCANCODE_DOWN, 2);
+    keys(SDL_SCANCODE_RETURN, 2);
+    SDL_Delay(1800);
+    CHECK_EQ(state_in("states/slot1.state"), s1);
+    CHECK(!exists("states/slot1.state.new"));
+    SDL_SetAtomicInt(&refuse_saves, 0);
+    quit_event();                                         /* the Autosave: the state at quitting */
+    return 0;
+}
+
+/* run 8: captures: the replay (F10), a recording of a second (Alt+Enter twice), F11 full screen
+ * on and off, the replay from the menu; then Record's key set to Ctrl+F11 by
+ * pressing it */
+static int capturer(void *user)
+{
+    (void)user;
+    until_frame(150);
+    press(SDL_SCANCODE_F10);
+    SDL_Delay(1000);
+    press_mod(SDL_SCANCODE_RETURN, SDL_KMOD_LALT);
+    SDL_Delay(1000);
+    press_mod(SDL_SCANCODE_RETURN, SDL_KMOD_LALT);
+    SDL_Delay(1000);
+    press(SDL_SCANCODE_F11);                              /* full screen and back: the game goes on */
+    SDL_Delay(300);
+    press(SDL_SCANCODE_F11);
+    SDL_Delay(300);
+    /* the menu: [Resume, Reset, Save, Load, Video, Capture ...]; Capture: [Save replay, Start
+     * recording, Replay length, GIF size, Back] */
+    keys(SDL_SCANCODE_ESCAPE, 1);
+    keys(SDL_SCANCODE_DOWN, 5);
+    keys(SDL_SCANCODE_RETURN, 2);                         /* the replay, from the menu */
+    SDL_Delay(1500);
+    keys(SDL_SCANCODE_ESCAPE, 1);
+    keys(SDL_SCANCODE_DOWN, 4);
+    keys(SDL_SCANCODE_RETURN, 1);                         /* Keys: [pads' keys ..., Record, Screenshot, Menu, Back] */
+    keys(SDL_SCANCODE_UP, 4);
+    keys(SDL_SCANCODE_RETURN, 1);                         /* Record: Ctrl waits for its key, then F11 */
+    keys(SDL_SCANCODE_LCTRL, 1);
+    press_mod(SDL_SCANCODE_F11, SDL_KMOD_LCTRL);
+    SDL_Delay(100);
+    keys(SDL_SCANCODE_ESCAPE, 2);
+    quit_event();
+    return 0;
+}
+
+static char *slurp(const char *path, long *len);
+
+/* a GIF's screen, its frames, the first frame's first pixel's colour (0 when it is not one) */
+static int gif_read(const char *path, int *w, int *h, uint32_t *first)
+{
+    long len = 0;
+    uint8_t *b = (uint8_t *)slurp(path, &len), *code = b ? malloc((size_t)len) : NULL;
+    int frames = 0;
+    if (!b || len < 13 || memcmp(b, "GIF89a", 6)) { free(b); free(code); return 0; }
+    *w = b[6] | b[7] << 8;
+    *h = b[8] | b[9] << 8;
+    long p = 13;
+    while (p < len && b[p] != 0x3B) {
+        if (b[p] == 0x21) {                               /* an extension: its blocks */
+            p += 2;
+            while (p < len && b[p]) p += 1 + b[p];
+            p++;
+        } else if (b[p] == 0x2C && p + 10 < len) {        /* an image */
+            int fw = b[p + 5] | b[p + 6] << 8, fh = b[p + 7] | b[p + 8] << 8, flags = b[p + 9];
+            const uint8_t *table = b + p + 10;
+            p += 10 + ((flags & 0x80) ? 3 << ((flags & 7) + 1) : 0);
+            int bits = b[p++];
+            size_t n = 0;
+            while (p < len && b[p]) { memcpy(code + n, b + p + 1, b[p]); n += b[p]; p += 1 + b[p]; }
+            p++;
+            if (!frames++) {
+                uint8_t *idx = malloc((size_t)fw * fh);
+                *first = idx && mdrt_gif_unlzw(code, n, bits, idx, (size_t)fw * fh)
+                         ? (uint32_t)table[3 * idx[0]] << 16 | (uint32_t)table[3 * idx[0] + 1] << 8 | table[3 * idx[0] + 2] : 0xFFFFFFFF;
+                free(idx);
+            }
+        } else break;
+    }
+    if (p >= len || b[p] != 0x3B) frames = 0;
+    free(b);
+    free(code);
+    return frames;
+}
+
+/* run 9: the client's own options page: a choice whose last value is a preset (it sets the others),
+ * a number, and choices standing for numbers (the settings file's 120, none of its choices'; and
+ * 150, more's, never changed); the values at each power on, and the save RAM file they name */
+static const char *const opt_names[3] = { "first", "second", "third" };
+static const char *const share_names[3] = { "normal", "more", "less" };
+static const int share_numbers[3] = { 100, 150, 50 };
+/* and a choice found on disk (browsed: a .zip or a folder), its choices the client's own, growing
+ * as the player finds them (the settings file's elsewhere/b.zip, then browse-test/a.zip) */
+static const char *found_names[4] = { "none" };
+static char found_paths[3][300], last_pick[300];
+static const mdrt_sdl_browse found_browse = { "Find one", "From", "browse-test", ".zip", 1 };
+static mdrt_sdl_option test_options[5] = {
+    { "test.choice", "A choice", 3, opt_names, NULL, 0, 0, 0, 0, NULL, NULL, NULL },
+    { "test.number", "A number", 0, NULL, NULL, 1, 9, 1, 4, NULL, NULL, NULL },
+    { "test.share", "A share", 3, share_names, NULL, 10, 200, 0, 0, share_numbers, "%", NULL },
+    { "test.kept", "Another", 3, share_names, NULL, 10, 200, 0, 0, share_numbers, "%", NULL },
+    { "test.found", "A found", 1, found_names, NULL, 0, 0, 0, 0, NULL, NULL, &found_browse },
+};
+static int options_pick(int which, const char *path, char *why, size_t why_size, void *user)
+{
+    (void)user;
+    SDL_AddAtomicInt(&picks, 1);
+    snprintf(last_pick, sizeof last_pick, "%s", path);
+    if (which != 4 || test_options[4].count >= 4) { snprintf(why, why_size, "no room"); return -1; }
+    int k = test_options[4].count++;
+    snprintf(found_paths[k - 1], sizeof found_paths[0], "%s", path);
+    found_names[k] = found_paths[k - 1];
+    return k;
+}
+static void options_detail(int which, int value, char *text, size_t size, void *user)
+{
+    (void)user;
+    snprintf(text, size, "%s", which == 4 && value ? found_names[value] : "(nothing)");
+}
+static void options_use(const int *v, void *user)
+{
+    (void)user;
+    for (int i = 0; i < 5; i++) SDL_SetAtomicInt(&opt_seen[i], v[i]);
+    SDL_AddAtomicInt(&opt_uses, 1);
+}
+static int options_changed(int which, int *v, void *user)
+{
+    (void)user;
+    if (which < 0) SDL_AddAtomicInt(&opt_read, 1);          /* (the values from the settings file) */
+    if (which == 0 && v[0] == 2) { v[1] = 9; v[2] = 75; return 1; }
+    return 0;
+}
+/* on two pages (the last option on one of its own), with lines under each page's options */
+static const mdrt_sdl_page test_pages[2] = { { "Test rules", "For the next game", 0, 3 }, { "More", NULL, 3, 2 } };
+static void options_text(int page, const int *v, char *text, size_t size, void *user)
+{
+    (void)user;
+    SDL_AddAtomicInt(&text_asked[page & 1], 1);
+    if (page == 0) SDL_SetAtomicInt(&text_share, v[2]);
+    if (page == 0) snprintf(text, size, "A line\nThe share\t%d%%\n", v[2]);
+    else snprintf(text, size, "Above them\n\fFirst\nOne\tthe first's\n\fSecond\nTwo\nThree\n");   /* (in sections: a choice of them) */
+}
+/* the save RAM's file follows the choice (records of their own for each) */
+static const char *sram_file(void *user) { (void)user; static char path[32]; snprintf(path, sizeof path, "options-%d.srm", SDL_GetAtomicInt(&opt_seen[0])); return path; }
+
+static int rules_player(void *user)
+{
+    (void)user;
+    until_frame(20);
+    CHECK(SDL_GetAtomicInt(&opt_uses) == 1 && SDL_GetAtomicInt(&opt_seen[0]) == 0 && SDL_GetAtomicInt(&opt_seen[1]) == 4);   /* the defaults */
+    CHECK_EQ(SDL_GetAtomicInt(&opt_seen[2]), 120);           /* (the file's number) */
+    CHECK_EQ(SDL_GetAtomicInt(&opt_read), 1);
+    CHECK_EQ(SDL_GetAtomicInt(&opt_seen[3]), 150);
+    CHECK(SDL_GetAtomicInt(&picks) == 1 && !strcmp(last_pick, "elsewhere/b.zip") && SDL_GetAtomicInt(&opt_seen[4]) == 1);   /* (the file's path, made a choice) */
+    CHECK(SDL_GetAtomicInt(&text_asked[0]) == 0 && SDL_GetAtomicInt(&text_asked[1]) == 0);   /* (not until a page is shown) */
+    /* the menu: [Resume, Reset, Save, Load, Video, Capture, Sound, Players, Test rules, More, Options ...] */
+    keys(SDL_SCANCODE_ESCAPE, 1);
+    keys(SDL_SCANCODE_DOWN, 8);
+    keys(SDL_SCANCODE_RETURN, 1);                         /* [A choice, A number, A share, its lines, Back] */
+    keys(SDL_SCANCODE_RIGHT, 2);                          /* first -> second -> third: the preset sets the number to 9, the share to 75 */
+    keys(SDL_SCANCODE_DOWN, 1);
+    keys(SDL_SCANCODE_LEFT, 1);                           /* 9 -> 8 */
+    keys(SDL_SCANCODE_DOWN, 1);                           /* [normal, more, less, custom (75%)] */
+    keys(SDL_SCANCODE_RIGHT, 1);                          /* custom -> normal (around the end) */
+    keys(SDL_SCANCODE_LEFT, 2);                           /* -> custom -> less */
+    keys(SDL_SCANCODE_RIGHT, 1);                          /* -> custom: 75 again */
+    SDL_Delay(100);
+    CHECK_EQ(SDL_GetAtomicInt(&opt_uses), 1);                /* (not until the next power on) */
+    printf("  options: page 1's lines asked for %d times, the share last %d\n", SDL_GetAtomicInt(&text_asked[0]), SDL_GetAtomicInt(&text_share));
+    CHECK(SDL_GetAtomicInt(&text_asked[0]) >= 8 && SDL_GetAtomicInt(&text_share) == 75 && SDL_GetAtomicInt(&text_asked[1]) == 0);
+    keys(SDL_SCANCODE_ESCAPE, 1);                         /* (back on Test rules) */
+    keys(SDL_SCANCODE_DOWN, 1);
+    keys(SDL_SCANCODE_RETURN, 1);                         /* More: [Another, A found, From, Above them, 1 of 2, its lines, Back] */
+    SDL_Delay(100);
+    CHECK_EQ(SDL_GetAtomicInt(&text_asked[1]), 1);
+    keys(SDL_SCANCODE_DOWN, 3);                           /* (the sections' line) */
+    keys(SDL_SCANCODE_RIGHT, 1);                          /* First -> Second: the page again */
+    keys(SDL_SCANCODE_RIGHT, 1);                          /* -> First (around the end) */
+    SDL_Delay(100);
+    printf("  options: More's lines asked for %d times (two sections stepped through)\n", SDL_GetAtomicInt(&text_asked[1]));
+    CHECK_EQ(SDL_GetAtomicInt(&text_asked[1]), 3);
+    keys(SDL_SCANCODE_UP, 3);                             /* (back on Another) */
+    keys(SDL_SCANCODE_DOWN, 2);
+    keys(SDL_SCANCODE_RETURN, 1);                         /* From: the browser in browse-test: [Use this folder, .., sub/, a.zip], on sub/ */
+    keys(SDL_SCANCODE_DOWN, 1);
+    keys(SDL_SCANCODE_RETURN, 1);                         /* a.zip: picked, made the choice */
+    SDL_Delay(100);
+    printf("  options: %d picks, the last %s\n", SDL_GetAtomicInt(&picks), last_pick);
+    CHECK(SDL_GetAtomicInt(&picks) == 2 && !strcmp(last_pick, "browse-test/a.zip"));
+    keys(SDL_SCANCODE_ESCAPE, 1);                         /* (back on More) */
+    keys(SDL_SCANCODE_DOWN, 1);
+    keys(SDL_SCANCODE_RETURN, 1);                         /* Options: [Fast-forward speed, FPS counter, Back] */
+    keys(SDL_SCANCODE_DOWN, 1);
+    keys(SDL_SCANCODE_RIGHT, 1);                          /* FPS counter: on */
+    SDL_Delay(1200);                                      /* (drawn: shown at the top right, a second of frames) */
+    keys(SDL_SCANCODE_ESCAPE, 1);                         /* (back on Options) */
+    keys(SDL_SCANCODE_UP, 9);
+    keys(SDL_SCANCODE_RETURN, 2);                         /* Reset, asked again */
+    SDL_Delay(500);
+    printf("  options: %d power ons, the last with %d, %d and %d\n", SDL_GetAtomicInt(&opt_uses), SDL_GetAtomicInt(&opt_seen[0]),
+           SDL_GetAtomicInt(&opt_seen[1]), SDL_GetAtomicInt(&opt_seen[2]));
+    CHECK(SDL_GetAtomicInt(&opt_uses) == 2 && SDL_GetAtomicInt(&opt_seen[0]) == 2 && SDL_GetAtomicInt(&opt_seen[1]) == 8 && SDL_GetAtomicInt(&opt_seen[2]) == 75);
+    quit_event();
+    return 0;
+}
+
+static int by_name(const void *a, const void *b) { return strcmp(a, b); }
+
+/* the videos' directory: its files of a kind, in order of name (up to 8) */
+static int videos(const char *ext, char names[8][300])
+{
+    DIR *d = opendir("videos");
+    struct dirent *e;
+    int n = 0;
+    while (d && (e = readdir(d)))
+        if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..") && strlen(e->d_name) > strlen(ext)
+            && !strcmp(e->d_name + strlen(e->d_name) - strlen(ext), ext) && n < 8)
+            snprintf(names[n++], 300, "videos/%s", e->d_name);
+    if (d) closedir(d);
+    qsort(names, (size_t)n, 300, by_name);
+    return n;
+}
+
+static const char *rom_check(const uint8_t *rom, size_t size, void *user)
+{
+    (void)user;
+    return size >= 4 && !memcmp(rom, "GOOD", 4) ? NULL : "not a ROM this game can run";
+}
+
+static void rom_use(const uint8_t *rom, size_t size, void *user)
+{
+    (void)user;
+    snprintf(rom_seen, sizeof rom_seen, "%.*s", (int)(size < 15 ? size : 15), (const char *)rom);
+}
+
+static void game(mdrt *m, void *user)
+{
+    (void)user;
+    SDL_AddAtomicInt(&starts, 1);
+    mdrt_vdp *v = mdrt_get_vdp(m);
+    static const uint8_t regs[] = { 0x04, 0x44, 0x30, 0x3C, 0x07, 0x6C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x81, 0x37, 0x00, 0x02, 0x01 };
+    for (int r = 0; r < (int)sizeof regs; r++) mdrt_vdp_ctrl16(v, (uint16_t)(0x8000 | r << 8 | regs[r]));
+    mdrt_vdp_ctrl32(v, 0xC0000000);
+    mdrt_vdp_data16(v, BACKDROP);
+    mdrt_psg_port(m, 0, 0x80 | (254 & 15));               /* a 440 Hz square, loud */
+    mdrt_psg_port(m, 100, 254 >> 4);
+    mdrt_psg_port(m, 200, 0x90);
+    SDL_Thread *t = run <= 2 ? SDL_CreateThread(player, "player", NULL) : run == 5 ? SDL_CreateThread(players, "players", NULL)
+                  : run == 6 || run == 7 ? SDL_CreateThread(slots, "slots", NULL)
+                  : run == 8 ? SDL_CreateThread(capturer, "capturer", NULL) : NULL;
+    for (;;) {
+        mdrt_vblank_end(m);
+        if (mdrt_wait_vblank(m)) break;
+        SDL_AddAtomicInt(&game_frame, 1);                    /* the game's own count: what a state holds */
+        if (run == 9) mdrt_sram_write8(mdrt_get_sram(m), 1, (uint8_t)SDL_GetAtomicInt(&game_frame));   /* (save RAM written: kept) */
+        unsigned req = mdrt_requests(m);
+        const char *path = mdrt_request_path(m);
+        if ((req & MDRT_REQUEST_SAVE) && path && !SDL_GetAtomicInt(&refuse_saves)) {
+            FILE *f = fopen(path, "wb");
+            if (f) { fprintf(f, "STATE %d\n", SDL_GetAtomicInt(&game_frame)); fclose(f); }
+        }
+        if ((req & MDRT_REQUEST_LOAD) && path) {
+            FILE *f = fopen(path, "rb");
+            int n;
+            if (f && fscanf(f, "STATE %d", &n) == 1) SDL_SetAtomicInt(&game_frame, n);
+            if (f) fclose(f);
+        }
+        SDL_SetAtomicInt(&held, mdrt_get_pads(m)->buttons[0]);
+        for (int p = 0; p < MDRT_PADS; p++) SDL_SetAtomicInt(&pads4[p], mdrt_get_pads(m)->buttons[p]);
+        SDL_SetAtomicInt(&adaptor, mdrt_get_pads(m)->adaptor);
+        SDL_SetAtomicInt(&fm_second, mdrt_fm_cores(1) && !strcmp(mdrt_fm_core_of(mdrt_get_fm(m)), mdrt_fm_cores(1)));
+        SDL_SetAtomicInt(&lowpass_on, (int)mdrt_lowpass(m));
+        SDL_AddAtomicInt(&frame, 1);
+    }
+    if (t) SDL_WaitThread(t, NULL);
+}
+
+static char *slurp(const char *path, long *len)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    fseek(f, 0, SEEK_END);
+    *len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    char *b = malloc((size_t)*len + 1);
+    if (b && fread(b, 1, (size_t)*len, f) != (size_t)*len) { free(b); b = NULL; }
+    if (b) b[*len] = 0;
+    fclose(f);
+    return b;
+}
+
+static void spit(const char *path, const char *text)
+{
+    FILE *f = fopen(path, "wb");
+    if (f) { fputs(text, f); fclose(f); }
+}
+
+static int play(void)
+{
+    SDL_SetAtomicInt(&frame, 0);
+    SDL_SetAtomicInt(&held, 0);
+    SDL_SetAtomicInt(&starts, 0);
+    mdrt_config c = { 0 };
+    c.audio_rate = 48000;
+    mdrt_sdl_options o = { .title = "platform test", .app = "platform-test" };   /* (settings.ini here) */
+    SDL_Thread *t = NULL;
+    if (run == 9) {
+        o.options_title = "Test rules";
+        o.options_note = "For the next game";
+        o.options = test_options;
+        o.noptions = 5;
+        o.pages = test_pages;
+        o.npages = 2;
+        o.options_text = options_text;
+        o.options_pick = options_pick;
+        o.options_detail = options_detail;
+        o.options_use = options_use;
+        o.options_changed = options_changed;
+        o.sram_path = "options.srm";
+        o.sram_file = sram_file;
+        c.sram_size = 0x2000;
+        remove("options-0.srm");
+        remove("options-2.srm");
+        t = SDL_CreateThread(rules_player, "rules", NULL);   /* (out of the game, which a reset restarts) */
+    }
+    if (run == 3 || run == 4) {
+        o.rom_default = "missing.gen";
+        o.rom_check = rom_check;
+        o.rom_use = rom_use;
+        t = SDL_CreateThread(menu_player, "menu player", NULL);
+    }
+    int r = mdrt_sdl_run(&c, &o, game, NULL);
+    if (t) SDL_WaitThread(t, NULL);
+    return r;
+}
+
+/* the screenshot: one PNG, the picture's size, the backdrop's colour */
+static void check_screenshot(void)
+{
+    DIR *d = opendir(shots);
+    struct dirent *e;
+    int n = 0;
+    char path[1024] = "";
+    while (d && (e = readdir(d)))
+        if (strstr(e->d_name, ".png")) { n++; snprintf(path, sizeof path, "%s/%s", shots, e->d_name); }
+    if (d) closedir(d);
+    CHECK_EQ(n, 1);
+    CHECK(strstr(path, "/platform-test-") != NULL);
+    long len = 0;
+    uint8_t *b = (uint8_t *)slurp(path, &len);
+    static uint32_t px[320 * 224];
+    CHECK(b && (size_t)len == mdrt_png_encode(px, 320, 224, 320, NULL, 0));
+    if (!b || len < 60) return;
+    CHECK(!memcmp(b + 12, "IHDR", 4) && b[18] == 320 >> 8 && b[19] == (320 & 255) && b[22] == 0 && b[23] == 224);
+    uint32_t rgb = mdrt_vdp_rgb(BACKDROP, 1), first = (uint32_t)b[49] << 16 | (uint32_t)b[50] << 8 | b[51];
+    CHECK_EQ(first, rgb & 0xFFFFFF);
+    printf("  screenshot: %s, %ld bytes, colour %06X\n", path, len, first);
+    free(b);
+}
+
+/* the sound on disk, a tenth of a second at a time: full volume, then 80%, and silent at the end */
+static void check_sound(void)
+{
+    long len = 0;
+    int16_t *s = (int16_t *)slurp(sound, &len);
+    CHECK(s != NULL);
+    if (!s) return;
+    long frames = len / 4, windows = frames / 4800;
+    int peak[200] = { 0 }, top = 0, full = 0, eighty = 0;
+    for (long w = 0; w < windows && w < 200; w++) {
+        for (long i = w * 9600; i < (w + 1) * 9600; i++) if (abs(s[i]) > peak[w]) peak[w] = abs(s[i]);
+        if (w > 0 && peak[w] > top) top = peak[w];       /* (the first tenth: the filters settling) */
+    }
+    for (long w = 0; w < windows && w < 200; w++) {
+        full += abs(peak[w] - top) < top / 50;
+        eighty += abs(peak[w] - top * 4 / 5) < top / 50;
+    }
+    printf("  sound: %.1f s, peak %d, %d tenths at full volume, %d at 80%%, the last %d and %d\n",
+           frames / 48000.0, top, full, eighty, windows > 1 ? peak[windows - 2] : -1, windows > 0 ? peak[windows - 1] : -1);
+    CHECK(top > 1000 && full >= 5 && eighty >= 5);
+    CHECK(windows > 3 && peak[windows - 2] == 0 && peak[windows - 1] == 0);
+    free(s);
+}
+
+static void check_settings(void)
+{
+    long len = 0;
+    char *t = slurp(settings_path, &len);
+    CHECK(t != NULL);
+    if (!t) return;
+    static const char *const want[] = {
+        "# the test's own comment\n", "mystery.key = kept\n", "general.screenshots = shots\n", "general.fast_forward = 4\n",
+        "audio.volume = 80\n", "audio.mute = 1\n", "video.scale = integer\n", "video.aspect = square\n",
+        "pad1.start = Return\n", "pad2.a = Q\n", "key.screenshot = F12\n", "key.slow_motion = F7\n", "key.pause = F5\n", "key.save_replay = F10\n", "key.record = Alt+Return\n", "key.mute = F1\n",
+        "key.menu = Escape\n", "game.rom =\n", "audio.lowpass = off\n",
+    };
+    for (size_t i = 0; i < sizeof want / sizeof *want; i++)
+        if (!strstr(t, want[i])) { printf("  settings: no \"%s\"\n", want[i]); CHECK(0); }
+    CHECK(!strstr(t, "key.save_state") && !strstr(t, "key.fullscreen") && !strstr(t, "capture.format"));   /* (an older build's: gone) */
+    free(t);
+}
+
+int main(int argc, char **argv)
+{
+    if (chdir(argc > 1 ? argv[1] : "build/sdltest")) { perror("chdir"); return 1; }   /* (the game's directory) */
+    SDL_setenv_unsafe("SDL_VIDEO_DRIVER", "dummy", 1);
+    SDL_setenv_unsafe("SDL_AUDIO_DRIVER", "disk", 1);
+    SDL_setenv_unsafe("SDL_AUDIO_DISK_OUTPUT_FILE", sound, 1);
+    remove(sound);
+    for (int i = 0; i <= 9; i++)                          /* (last time's save slots: the ROM page lists folders) */
+        for (int k = 0; k < 4; k++) {
+            static const char *const ext[4] = { ".state", ".png", ".state.new", ".state.seen" };
+            char p[64];
+            if (i == 9) snprintf(p, sizeof p, "states/resume%s", ext[k]);   /* (the quick resume's, before the Autosave) */
+            else if (i) snprintf(p, sizeof p, "states/slot%d%s", i, ext[k]);
+            else snprintf(p, sizeof p, "states/autosave%s", ext[k]);
+            remove(p);
+        }
+    remove_dir("states");
+    char names[8][300], others[8][300];
+    for (int i = 0, n = videos("", names); i < n; i++) remove(names[i]);   /* (last time's captures: a folder too) */
+    remove_dir("videos");
+    DIR *d = opendir(shots);                              /* (last time's screenshots) */
+    struct dirent *e;
+    char path[1024];
+    while (d && (e = readdir(d))) if (strstr(e->d_name, ".png")) { snprintf(path, sizeof path, "%s/%s", shots, e->d_name); remove(path); }
+    if (d) closedir(d);
+    char text[1024];
+    snprintf(text, sizeof text, "# the test's own comment\nmystery.key = kept\ngeneral.screenshots = %s\nvideo.scale = integer\n"
+             "key.save_state = F9\nkey.fullscreen = F11\ncapture.format = mp4\nkey.record = F11\n", shots);   /* (the last four: an older build's; Record's F11 becomes Alt+Return) */
+    spit(settings_path, text);
+    run = 1;
+    CHECK_EQ(play(), 0);
+    check_screenshot();
+    check_sound();
+    check_settings();
+    /* by hand: Start on S, A on nothing, B on K (pad 2's down, now pad 1's too) */
+    long len = 0;
+    char *t = slurp(settings_path, &len), *edited = t ? malloc((size_t)len + 64) : NULL;
+    if (edited) {
+        const char *rules[][2] = { { "pad1.start = Return\n", "pad1.start = S\n" }, { "pad1.a = Z\n", "pad1.a =\n" }, { "pad1.b = X\n", "pad1.b = K\n" } };
+        strcpy(edited, t);
+        for (size_t i = 0; i < 3; i++) {
+            char *at = strstr(edited, rules[i][0]);
+            CHECK(at != NULL);
+            if (at) { memmove(at + strlen(rules[i][1]), at + strlen(rules[i][0]), strlen(at + strlen(rules[i][0])) + 1); memcpy(at, rules[i][1], strlen(rules[i][1])); }
+        }
+        spit(settings_path, edited);
+    }
+    free(t); free(edited);
+    run = 2;
+    CHECK_EQ(play(), 0);
+    /* the menu: ROMs the test's client checks ("GOOD" at the start), one in a folder */
+    make_dir("roms");
+    spit("bad.gen", "BAD!");
+    spit("good.gen", "GOOD-good");
+    spit("roms/other.gen", "GOOD-other");
+    remove("states/autosave.state");                      /* (runs 1 and 2 quit in play: their Autosave, out of the ROM page's way) */
+    remove("states/autosave.png");
+    remove_dir("states");
+    run = 3;
+    CHECK_EQ(play(), 0);
+    t = slurp(settings_path, &len);
+    CHECK(t && strstr(t, "game.rom = roms/other.gen\n") && strstr(t, "video.scale = fit\n") && strstr(t, "pad1.start = Home\n"));
+    CHECK(t && strstr(t, "video.upscaler = mmpx4x\n") && strstr(t, "video.colours = console\n") && strstr(t, "video.blend = dither\n"));
+    CHECK(t && strstr(t, "video.scanlines = medium\n") && strstr(t, "video.mask = dot\n") && strstr(t, "video.vsync = on\n"));
+    CHECK(t && strstr(t, "video.pacing = display\n") && strstr(t, "video.late_input = 4\n"));
+    CHECK(t && strstr(t, "audio.lowpass = on\n"));
+    if (t && mdrt_fm_cores(1)) { char want[64]; snprintf(want, sizeof want, "audio.fm_core = %s\n", mdrt_fm_cores(1)); CHECK(strstr(t, want) != NULL); }
+    free(t);
+    run = 4;
+    CHECK_EQ(play(), 0);
+    /* four players: the adaptor, two controllers given to players 1 and 3, C on Y, turbo B */
+    t = slurp(settings_path, &len);
+    if (t) {
+        static const char *const old[] = { "input.adaptor = none\n", "player1.controller = 1\n", "player3.controller = 3\n",
+                                           "controller.c = b\n", "controller.turbo_b =\n", "video.pacing = display\n" };
+        for (size_t i = 0; i < sizeof old / sizeof *old; i++) {   /* (made comments; the new values follow) */
+            char *at = strstr(t, old[i]);
+            if (at) *at = '#';
+        }
+        char *ed = malloc((size_t)len + 512);
+        snprintf(ed, (size_t)len + 512, "%sinput.adaptor = ea4way\nplayer1.controller = 2\nplayer3.controller = 1\ncontroller.c = y\n"
+                 "controller.turbo_b = rightshoulder\nvideo.pacing = sound\n", t);   /* (turbo counted by the frame: the dummy screen's slow presents would slow them) */
+        spit(settings_path, ed);
+        free(ed);
+    }
+    free(t);
+    run = 5;
+    CHECK_EQ(play(), 0);
+    t = slurp(settings_path, &len);
+    CHECK(t && strstr(t, "\nplayer1.controller = 3\n") && strstr(t, "\ncontroller.a = leftstick\n"));
+    free(t);
+    /* save slots and the Autosave */
+    for (int i = 0; i <= 2; i++) {                        /* (last time's) */
+        char p[64];
+        snprintf(p, sizeof p, i ? "states/slot%d.state" : "states/autosave.state", i);
+        remove(p);
+    }
+    SDL_SetAtomicInt(&game_frame, 0);
+    run = 6;
+    CHECK_EQ(play(), 0);
+    int quit_at = state_in("states/autosave.state");
+    CHECK(quit_at > 0);
+    SDL_SetAtomicInt(&game_frame, 0);
+    SDL_SetAtomicInt(&refuse_saves, 0);
+    run = 7;
+    CHECK_EQ(play(), 0);
+    CHECK_EQ(state_in("states/autosave.state"), quit_at);   /* (quit out of play: the last Autosave kept) */
+    /* captures: the replay, a recording, the replay from the menu */
+    t = slurp(settings_path, &len);
+    if (t) {
+        char *ed = malloc((size_t)len + 64);
+        snprintf(ed, (size_t)len + 64, "%scapture.replay = 10\nvideo.upscaler = xbr3x\n", t);   /* (and xBR from here) */
+        spit(settings_path, ed);
+        free(ed);
+        free(t);
+    }
+    run = 8;
+    CHECK_EQ(play(), 0);
+    int n = videos(".gif", names), gw = 0, gh = 0, frames[3] = { 0 };
+    CHECK_EQ(n, 3);
+    CHECK_EQ(videos(".clip", others), 0);                 /* (the recording's file: gone) */
+    for (int i = 0; i < n && i < 3; i++) {
+        uint32_t first = 0;
+        frames[i] = gif_read(names[i], &gw, &gh, &first);
+        CHECK(gw == 320 && gh == 224 && first == mdrt_vdp_rgb(BACKDROP, MDRT_RGB_CONSOLE));   /* (run 3's colours) */
+    }
+    printf("  captures: GIFs of %d, %d and %d frames\n", frames[0], frames[1], frames[2]);
+    CHECK(frames[0] >= 60 && frames[0] <= 120);           /* ~2.5 s at 30 a second */
+    CHECK(frames[1] >= 15 && frames[1] <= 45);            /* the recording: ~1 s */
+    CHECK(frames[2] >= 20);                               /* the replay since the first */
+    t = slurp(settings_path, &len);
+    CHECK(t && strstr(t, "key.save_replay = F10\n") && strstr(t, "key.record = Ctrl+F11\n"));
+    free(t);
+    /* the client's options */
+    run = 9;
+    FILE *sf = fopen(settings_path, "a");                 /* (a number in the file, none of its choices') */
+    if (sf) { fputs("test.share = 120\ntest.kept = 150\ntest.found = elsewhere/b.zip\n", sf); fclose(sf); }
+    make_dir("browse-test");                              /* (the browser's folder: a folder and a .zip, and a file it leaves out) */
+    make_dir("browse-test/sub");
+    FILE *z = fopen("browse-test/a.zip", "wb"), *o = fopen("browse-test/notes.txt", "wb");
+    if (z) fclose(z);
+    if (o) fclose(o);
+    CHECK_EQ(play(), 0);
+    t = slurp(settings_path, &len);
+    CHECK(t && strstr(t, "test.choice = third\n") && strstr(t, "test.number = 8\n") && strstr(t, "test.share = 75\n"));
+    CHECK(t && strstr(t, "test.kept = 150\n"));          /* (a choice's number, never changed: as written) */
+    CHECK(t && strstr(t, "general.show_fps = 1\n"));     /* (the FPS counter, turned on in Options) */
+    CHECK(t && strstr(t, "test.found = browse-test/a.zip\n") && SDL_GetAtomicInt(&opt_seen[4]) == 2);   /* (the path the settings keep) */
+    remove("browse-test/a.zip");
+    remove("browse-test/notes.txt");
+    remove_dir("browse-test/sub");
+    remove_dir("browse-test");
+    free(t);
+    FILE *f0 = fopen("options-0.srm", "rb"), *f2 = fopen("options-2.srm", "rb"), *fo = fopen("options.srm", "rb");
+    CHECK(f0 && f2 && !fo);                               /* each game's save RAM in the file its options named */
+    if (f0) fclose(f0);
+    if (f2) fclose(f2);
+    if (fo) fclose(fo);
+    remove("options-0.srm");
+    remove("options-2.srm");
+    return check_done("platform_test");
+}

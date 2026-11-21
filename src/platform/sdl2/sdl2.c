@@ -381,6 +381,11 @@ static void audio(void *user, const int16_t *samples, int frames)
     int k = (session || SDL_AtomicGet(&s->by_display)) && s->queued >= (unsigned)s->queue_frames ? stretch(s, samples, frames) : 0;
     if (k) { samples = s->stretched; frames = k; }
     SDL_QueueAudio(s->dev, samples, (Uint32)frames * 4);
+    {   /* MDRT_SDL_STATS=FILE: the sound queued after each frame's, in sample frames (a text line each) */
+        static FILE *stats; static int asked;
+        if (!asked) { const char *e = getenv("MDRT_SDL_STATS"); asked = 1; if (e && *e) stats = fopen(e, "w"); }
+        if (stats) fprintf(stats, "%u\n", (unsigned)(SDL_GetQueuedAudioSize(s->dev) / 4));
+    }
     if (++s->queued == (unsigned)s->queue_frames) SDL_PauseAudioDevice(s->dev, 0);   /* start once there is some */
 }
 

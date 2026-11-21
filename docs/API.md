@@ -1,8 +1,8 @@
 # Using pulseman from a client
 
 A client is a game reimplemented in C whose hardware accesses were 68k bus accesses. It links
-`build/release/libmdrt.a` (and `libmdrt_sdl2.a` for a window), includes `mdrt/mdrt.h` (and
-`mdrt/platform_sdl2.h`), and maps its hardware calls onto the runtime: a hardware layer of a
+`build/release/libmdrt.a` (and `libmdrt_sdl2.a` for a window, or `libmdrt_sdl3.a`: the same API
+on SDL3, `make sdl3`), includes `mdrt/mdrt.h` (and `mdrt/platform_sdl2.h`, for either), and maps its hardware calls onto the runtime: a hardware layer of a
 hundred lines or so (VDP ports, the pads, save RAM, the sound chips) and a main that starts the
 platform.
 

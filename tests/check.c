@@ -8,7 +8,7 @@ int check_failures, check_count;
 void check_fail(const char *file, int line, const char *what)
 {
     if (check_failures < 20) printf("  FAIL %s:%d: %s\n", file, line, what);
-    check_failures++;
+    __atomic_fetch_add(&check_failures, 1, __ATOMIC_RELAXED);
 }
 
 int check_done(const char *name)
